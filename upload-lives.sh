@@ -36,6 +36,8 @@
 # - A short recording (under MIN_LIVE_MB, or under MIN_LIVE_SECONDS from start to stop) is a test, not a
 #   live: it goes to "Uploader checks/Short recordings" in Drive, where Brandon's PC never makes clips of it.
 # - A new version can take over mid-upload: the upload stops and starts again with it a minute later.
+# - When Google Drive says how much space is left, it uploads one recording at a time, oldest first, and only
+#   those that fit (with DRIVE_MARGIN_MB to spare). Nothing is sent that Drive would refuse.
 # None of this needs any app open: launchd runs it every minute while the Mac is on and signed in.
 # Written for macOS's own bash 3.2; runs on Linux too, which is how it is tested (self-test.command).
 set -u
@@ -57,6 +59,7 @@ UPDATE_URL="https://raw.githubusercontent.com/BrandonLeeRutlidge/salsabeel-uploa
 UPDATE_EVERY=3600
 MIN_LIVE_MB="${SALSABEEL_UPLOADER_MIN_LIVE_MB:-100}"   # smaller than this, or shorter than MIN_LIVE_SECONDS,
 MIN_LIVE_SECONDS=600                                   # is a test recording, not a live
+DRIVE_MARGIN_MB=200    # room kept free in Google Drive
 STATUS_EVERY=1800
 CHECKS_FOLDER="Uploader checks"
 TEMPLATE="${SALSABEEL_UPLOADER_TEMPLATE:-$APP_DIR/status-page.html}"
@@ -539,11 +542,36 @@ done
 waiting=$(pending | grep -c . || true)
 FILES_LABEL=$(label)
 
-total=$(du -sk "$READY" | cut -f1)
-log "Uploading $waiting file(s), $(( total / 1024 )) MB, to $DEST"
+# Only what fits in Google Drive, oldest first, one at a time.
+free=""
+if is_remote; then
+    free=$("$RCLONE" about "$REMOTE:" --json --contimeout 15s --timeout 30s 2>/dev/null | tr -d ' \n' |
+           sed -nE 's/.*"free":([0-9]+).*/\1/p')
+fi
+budget=${free:-0}
+: > "$APP_DIR/to-upload"
+total=0; count=0
+while IFS= read -r f; do
+    size=$(fsize "$f")
+    if [ -z "$free" ] || [ $(( size + DRIVE_MARGIN_MB * 1048576 )) -le "$budget" ]; then
+        printf '%s\n' "${f#"$READY"/}" >> "$APP_DIR/to-upload"
+        budget=$(( budget - size )); total=$(( total + size )); count=$(( count + 1 ))
+    fi
+done < <(pending | sort)
+if [ "$count" -eq 0 ]; then
+    msg="Google Drive is full ($(( ${free:-0} / 1048576 )) MB free): $waiting recording(s) wait on this Mac until there is room."
+    if [ "$(cat "$APP_DIR/full-noted" 2>/dev/null)" != "$msg" ]; then log "$msg"; echo "$msg" > "$APP_DIR/full-noted"; fi
+    pct=0
+    status_full
+    status_if_due
+    exit 0
+fi
+rm -f "$APP_DIR/full-noted"
+if [ "$count" -lt "$waiting" ]; then log "Google Drive has room for $count of the $waiting waiting; the rest go once there is space."; fi
+log "Uploading $count file(s), $(( total / 1048576 )) MB, to $DEST"
 PROGRESS="$APP_DIR/upload-progress.log"
 : > "$PROGRESS"
-args=(move "$READY" "$DEST" --exclude ".*" --retries 3 --low-level-retries 20
+args=(move "$READY" "$DEST" --files-from "$APP_DIR/to-upload" --transfers 1 --retries 3 --low-level-retries 20
       --stats 2s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file "$PROGRESS")
 if [ -n "$BWLIMIT" ]; then args+=(--bwlimit "$BWLIMIT"); fi
 

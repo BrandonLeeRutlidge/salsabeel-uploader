@@ -244,6 +244,28 @@ check "a new version takes over mid-upload, and the upload waits for it" \
 kill "$up" 2>/dev/null; cp upload-lives.sh "$ROOT/app/upload-lives.sh"; setup "$DRIVE"
 bash "$ROOT/app/upload-lives.sh"
 
+# Google Drive nearly full: only what fits goes up, oldest first; nothing is sent when nothing fits
+cat > "$ROOT/small-rclone" <<EOF
+#!/bin/bash
+if [ "\$1" = about ]; then echo "{\"total\":15000,\"free\":\$(cat "$ROOT/drive-free")}"; exit 0; fi
+exec "$RCLONE" "\$@"
+EOF
+chmod +x "$ROOT/small-rclone"
+printf '[testdrive]\ntype = alias\nremote = %s\n' "$ROOT/Google Drive" > "$ROOT/rclone.conf"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\nDRIVE_MARGIN_MB=0\n' "$REC" "testdrive:Salsabeel lives" "$ROOT/small-rclone" > "$ROOT/app/config.sh"
+echo 6000 > "$ROOT/drive-free"
+head -c 4096 /dev/zero > "$REC/older.mp4"; agos "$REC/older.mp4" 900
+head -c 4096 /dev/zero > "$REC/newer.mp4"; agos "$REC/newer.mp4" 600
+before=$(count "$DRIVE" "Salsabeel live *.mp4")
+RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
+check "Drive nearly full: only what fits is uploaded, and the other waits" \
+      '[ "$(count "$DRIVE" "Salsabeel live *.mp4")" = $((before + 1)) ] && [ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ]'
+echo 100 > "$ROOT/drive-free"
+RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
+check "nothing fits: nothing is sent, and the page says Drive is full" \
+      '[ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ] && grep -q "Google Drive is full" "$PAGE" && grep -q "wait on this Mac until there is room" "$ROOT/test.log"'
+setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
+
 if [ -f manifest.txt ]; then
     check "manifest.txt matches these files (run streaming-mac/build.sh after a change)" \
           '( for n in upload-lives.sh status-page.html; do grep -qx "$(sha "$n")  $n" manifest.txt || exit 1; done )'
