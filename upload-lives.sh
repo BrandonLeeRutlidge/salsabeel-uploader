@@ -76,6 +76,7 @@ LIVE_GUARD_LOSS=2              # ... or more pings lost than this %: half speed 
 LIVE_PAUSE_SECONDS=600         # the pause
 LIVE_RELAX_SECONDS=600         # after trouble it stays below that speed for this long
 SLEEP_GAP_SECONDS=600          # no run for this long: the Mac was asleep (or off)
+CLEAR_EVERY=120                # how often it looks for lives Brandon's PC has copied (every minute while Drive is full)
 PING_HOSTS="${SALSABEEL_UPLOADER_PING_HOSTS:-1.1.1.1 8.8.8.8}"
 PING="${SALSABEEL_UPLOADER_PING:-ping}"
 STATUS_IDLE_EVERY=1800   # the status note: every 30 minutes when nothing is happening,
@@ -613,19 +614,30 @@ rescue_moved() {   # once an hour: recordings left in a moved "Salsabeel lives" 
 }
 
 clear_copied() {   # lives Brandon's PC has copied to its own Drive ("Copied - ..."): delete them here for good
-    local f n=0
-    if [ -f "$APP_DIR/cleared-checked" ] && [ $(( now - $(mtime "$APP_DIR/cleared-checked") )) -lt 600 ]; then return 0; fi
+    local f n=0 err t      # Only API calls, so it also runs during lives and mid-upload (see the upload loop).
+    t=$(date +%s)
+    if [ ! -f "$APP_DIR/full-noted" ] && [ -f "$APP_DIR/cleared-checked" ] &&
+       [ $(( t - $(mtime "$APP_DIR/cleared-checked") )) -lt "$CLEAR_EVERY" ]; then return 0; fi
     touch "$APP_DIR/cleared-checked"
     "$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 60s 2>/dev/null | grep '^Copied - ' > "$APP_DIR/copied" || return 0
     while IFS= read -r f; do
         is_video "$f" || continue
-        if "$RCLONE" deletefile "$DEST/$f" --drive-use-trash=false --contimeout 15s --timeout 60s >/dev/null 2>&1; then
+        if err=$("$RCLONE" deletefile "$DEST/$f" --drive-use-trash=false --contimeout 15s --timeout 60s 2>&1); then
             log "Deleted \"$f\" from this Google Drive: Brandon's PC has its own copy."
             n=$((n + 1))
+        else
+            warn_copied "$f" "$(printf '%s' "$err" | tail -n 1)"
         fi
     done < "$APP_DIR/copied"
     if [ "$n" -gt 0 ]; then STATUS_NOW=1; fi
     return 0
+}
+warn_copied() {   # a delete that failed: logged once an hour per file, with rclone's reason
+    local key
+    key=$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')
+    if [ -f "$APP_DIR/copied-failed.$key" ] && [ $(( $(date +%s) - $(mtime "$APP_DIR/copied-failed.$key") )) -lt 3600 ]; then return 0; fi
+    touch "$APP_DIR/copied-failed.$key"
+    log "Could not delete \"$1\" from Google Drive: ${2:-no reason given}"
 }
 
 follow_live_studio
@@ -638,8 +650,8 @@ if [ -s "$FOLLOW" ]; then
     done < "$FOLLOW"
     mv -f "$FOLLOW.next" "$FOLLOW"
 fi
+clear_copied   # first: it frees space for the Drive check below
 rescue_moved
-clear_copied
 
 pending() { find "$READY" -type f ! -name '.*' 2>/dev/null; }
 label() { pending | while IFS= read -r f; do basename "$f"; done | paste -sd ',' - | sed 's/,/, /g'; }
@@ -783,6 +795,7 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
             log "The new version takes over after this upload (a live is on, so it is not started again)."
         fi
     fi
+    clear_copied   # during long (live) uploads too: only API calls (it checks every CLEAR_EVERY seconds)
     if [ $((ticks % 8)) -eq 0 ]; then
         if [ "$mode" = full ] && recording_now; then   # a live has started
             full_only=""

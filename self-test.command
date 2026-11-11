@@ -467,6 +467,41 @@ check "the live ends: back to full speed at once, and the upload finishes" \
 kill "$up" 2>/dev/null; rm -f "$REC/on_air.mp4"
 setup "$DRIVE"
 
+# Lives Brandon's PC has copied are deleted during a long live upload too (only API calls), and failures are logged
+: > "$ROOT/test.log"; start_live
+head -c 4000000 /dev/urandom > "$LIVE7"
+trickle_setup 'CLEAR_EVERY=3'
+bash "$ROOT/app/upload-lives.sh" & up=$!
+sleep 4; head -c 4096 /dev/zero > "$DRIVE/Copied - Salsabeel live 2026-11-06 18-00.mp4"
+for i in $(seq 1 20); do [ -e "$DRIVE/Copied - Salsabeel live 2026-11-06 18-00.mp4" ] || break; sleep 1; done
+check "a copied live is deleted mid-upload during a live, not hours later" \
+      'kill -0 "$up" 2>/dev/null && [ ! -e "$DRIVE/Copied - Salsabeel live 2026-11-06 18-00.mp4" ] && grep -q "Deleted \"Copied - Salsabeel live 2026-11-06 18-00.mp4\"" "$ROOT/test.log"'
+wait "$up"; stop_live; rm -f "$REC/on_air.mp4"
+cat > "$ROOT/nodelete-rclone" <<EOF
+#!/bin/bash
+if [ "\$1" = deletefile ]; then echo "ERROR : googleapi: Error 403: The user does not have sufficient permissions for this file., insufficientFilePermissions" >&2; exit 1; fi
+exec "$RCLONE" "\$@"
+EOF
+chmod +x "$ROOT/nodelete-rclone"
+head -c 4096 /dev/zero > "$DRIVE/Copied - Salsabeel live 2026-11-05 18-00.mp4"; : > "$ROOT/test.log"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\nCLEAR_EVERY=0\n' "$REC" "$DRIVE" "$ROOT/nodelete-rclone" > "$ROOT/app/config.sh"
+bash "$ROOT/app/upload-lives.sh"; bash "$ROOT/app/upload-lives.sh"
+check "a delete that fails is logged with Google's reason, once (not every minute)" \
+      '[ "$(grep -c "Could not delete \"Copied - Salsabeel live 2026-11-05 18-00.mp4\" from Google Drive: .*insufficientFilePermissions" "$ROOT/test.log")" = 1 ]'
+setup "$DRIVE"; rm -f "$DRIVE/Copied - Salsabeel live 2026-11-05 18-00.mp4"
+
+# Drive full: the copied lives are deleted first, every minute, before the Drive check
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\nDRIVE_MARGIN_MB=0\n' "$REC" "testdrive:Salsabeel lives" "$ROOT/small-rclone" > "$ROOT/app/config.sh"
+printf '[testdrive]\ntype = alias\nremote = %s\n' "$ROOT/Google Drive" > "$ROOT/rclone.conf"
+echo 100 > "$ROOT/drive-free"; : > "$ROOT/test.log"; touch "$ROOT/app/cleared-checked"; echo full > "$ROOT/app/full-noted"
+head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-09 18-02.mp4"
+head -c 4096 /dev/zero > "$DRIVE/Copied - Salsabeel live 2026-11-04 18-00.mp4"
+RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
+order=$(grep -oE "Deleted \"Copied - Salsabeel live 2026-11-04|Google Drive is full" "$ROOT/test.log" | paste -sd '|' -)
+check "Drive full: copied lives are deleted every minute, before the Drive check ($order)" \
+      '[ "$order" = "Deleted \"Copied - Salsabeel live 2026-11-04|Google Drive is full" ]'
+setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
+
 # The lid shut with lives waiting: the note says the Mac slept, and when
 setup "$DRIVE"; echo 12 > "$ROOT/app/waiting-count"; agos "$ROOT/app/last-run" 39600; rm -f "$ROOT/app/status-sent" "$ROOT/app/last-sleep"
 bash "$ROOT/app/upload-lives.sh"
