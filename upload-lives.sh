@@ -56,21 +56,26 @@ DEST="salsabeel-drive:Salsabeel lives"
 RCLONE=""
 ONLY_NEW_SINCE=""     # set when the recording folder also holds other videos: older ones are left alone
 UPDATE_URL="https://raw.githubusercontent.com/BrandonLeeRutlidge/salsabeel-uploader/main"
-UPDATE_EVERY=3600
+UPDATE_EVERY=600       # how often it looks for a new version (just manifest.txt; the rest only when it changed)
 MIN_LIVE_MB="${SALSABEEL_UPLOADER_MIN_LIVE_MB:-100}"   # smaller than this, or shorter than MIN_LIVE_SECONDS,
 MIN_LIVE_SECONDS=600                                   # is a test recording, not a live
 DRIVE_MARGIN_MB=200    # room kept free in Google Drive
-# Uploading during a live: slowly, and never at the stream's expense. LIVE_UPLOAD=off waits for the live to end.
+# Uploading during a live: as much of the line as the stream can spare. LIVE_UPLOAD=off waits for the live to end.
 LIVE_UPLOAD=on
-LIVE_UPLOAD_MAX_MBIT=4         # the most it ever uses during a live (LIVE Studio needs about 4-6 Mbit/s up)
-LIVE_UPLOAD_MIN_MBIT=1.5       # it starts at a tenth of the line's measured speed, but not below this
+LIVE_UPLOAD_MAX_MBIT=20        # the ceiling is the lowest of: this hard cap ("" = none) ...
+LIVE_LINE_SHARE=40             # ... this % of the line's measured upload speed ...
+LIVE_STREAM_RESERVE_MBIT=10    # ... and the line less this, kept for the stream (LIVE Studio sends about 4-6 Mbit/s)
+LIVE_UPLOAD_MIN_MBIT=1.5       # it starts here, and never sets less than this unless the line is in trouble
+LIVE_UNKNOWN_MAX_MBIT=4        # the most until the line's speed has been measured
 LIVE_UPLOAD_FLOOR_KBIT=500     # halving below this pauses instead
-LINE_DEFAULT_MBIT=10           # the line's upload speed until one has been measured
-LIVE_GUARD_EVERY=25            # seconds between checks on the line's delay
-LIVE_GUARD_MS=80               # more delay than the baseline by this much ...
-LIVE_GUARD_LOSS=2              # ... or more pings lost than this %: the upload slows down at once
-LIVE_GOOD_SECONDS=300          # this long without trouble: 25% faster
-LIVE_PAUSE_SECONDS=600         # still in trouble: stop for this long
+LIVE_RAMP_SECONDS=120          # this long without trouble: 25% faster, up to the ceiling
+LIVE_GUARD_EVERY=25            # seconds between checks on the line's delay ...
+LIVE_GUARD_FAST_EVERY=10       # ... and above 4 Mbit/s
+LIVE_GUARD_MS=50               # the delay up by this much over the baseline ...
+LIVE_GUARD_LOSS=2              # ... or more pings lost than this %: half speed at once; twice: the minimum; three times: a pause
+LIVE_PAUSE_SECONDS=600         # the pause
+LIVE_RELAX_SECONDS=600         # after trouble it stays below that speed for this long
+SLEEP_GAP_SECONDS=600          # no run for this long: the Mac was asleep (or off)
 PING_HOSTS="${SALSABEEL_UPLOADER_PING_HOSTS:-1.1.1.1 8.8.8.8}"
 PING="${SALSABEEL_UPLOADER_PING:-ping}"
 STATUS_IDLE_EVERY=1800   # the status note: every 30 minutes when nothing is happening,
@@ -86,6 +91,7 @@ shopt -u patsub_replacement 2>/dev/null || true
 PATH="/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 mkdir -p "$(dirname "$LOG")" "$APP_DIR"
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+if [ "$(uname)" = "Darwin" ]; then PREV_RUN=$(stat -f %m "$APP_DIR/last-run" 2>/dev/null); else PREV_RUN=$(stat -c %Y "$APP_DIR/last-run" 2>/dev/null); fi
 touch "$APP_DIR/last-run"     # "Fix Salsabeel uploader" reads this to see that the Mac really runs it
 
 # Put back anything of its own that has gone missing (moved or deleted), from the backup copy.
@@ -133,6 +139,12 @@ write_status() {   # state badge heading message percent detail title
     page=${page//__DETAIL__/$6}
     page=${page//__TITLE__/$7}
     page=${page//__FILE__/$FILES_LABEL}
+    local notice=""
+    if [ -n "$(find "${READY:-/nonexistent}" -type f ! -name '.*' 2>/dev/null | head -n 1)" ]; then
+        notice="Please leave the laptop open after the last live until uploads say Done"
+    fi
+    page=${page//__NOTICE__/$notice}
+    page=${page//__LINE__/Line: $(line_report 2>/dev/null)}
     printf '%s\n' "$page" > "$PAGE.tmp" && mv -f "$PAGE.tmp" "$PAGE"
 }
 open_page() { "$OPEN_PAGE" "$PAGE" >/dev/null 2>&1 || true; boot_id > "$APP_DIR/page-opened-boot"; }
@@ -203,7 +215,7 @@ update_if_due() {
     if [ -f "$checked" ] && [ $(( now_s - $(mtime "$checked") )) -lt "$UPDATE_EVERY" ]; then return 0; fi
     touch "$checked"
     tmp=$(mktemp -d "$APP_DIR/.update.XXXXXX") || return 0
-    if ! curl -fsSL --max-time 30 -o "$tmp/manifest.txt" "$UPDATE_URL/manifest.txt" 2>/dev/null; then
+    if ! curl -fsSL --connect-timeout 10 --max-time 20 -o "$tmp/manifest.txt" "$UPDATE_URL/manifest.txt" 2>/dev/null; then
         rm -rf "$tmp"; return 0
     fi
     version=$(sed -n 's/^version //p' "$tmp/manifest.txt" | head -n 1)
@@ -211,7 +223,7 @@ update_if_due() {
     if [ -z "$version" ] || [ "$version" = "$current" ]; then rm -rf "$tmp"; return 0; fi
     while read -r sum name; do
         case "$name" in upload-lives.sh|status-page.html) ;; *) continue ;; esac   # nothing else is replaced
-        if curl -fsSL --max-time 300 -o "$tmp/$name" "$UPDATE_URL/$name" 2>/dev/null &&
+        if curl -fsSL --connect-timeout 10 --max-time 120 -o "$tmp/$name" "$UPDATE_URL/$name" 2>/dev/null &&
            [ "$(sha256 "$tmp/$name")" = "$sum" ]; then
             names="$names $name"
         else
@@ -254,6 +266,10 @@ send_status() {
         echo
         echo "Sent:               $(date '+%Y-%m-%d %H:%M') (every 5 minutes while busy, otherwise every 30, while the Mac is on and online)"
         echo "Now:                ${NOW_LINE:-Nothing to upload}"
+        if [ -f "$APP_DIR/last-sleep" ] && [ $(( $(date +%s) - $(mtime "$APP_DIR/last-sleep") )) -lt 86400 ]; then
+            echo "Asleep:             $(cat "$APP_DIR/last-sleep")"
+        fi
+        echo "Line:               $(line_report)"
         echo "Mac:                $mac"
         echo "Version:            $(cat "$APP_DIR/VERSION" 2>/dev/null || echo unknown)"
         echo "Recording folder:   $WATCH_DIR"
@@ -404,7 +420,93 @@ fi
 rm -f "$APP_DIR/warned"
 backup_self
 
+
+# --- Uploading during a live -------------------------------------------------------------------------
+kbit_of() { awk -v m="$1" 'BEGIN { printf "%d", m * 1000 }'; }        # "1.5" Mbit/s -> 1500 kbit/s
+mbit_of() { awk -v k="$1" 'BEGIN { printf "%.1f", k / 1000 }'; }      # 1500 kbit/s -> "1.5"
+rate_of() { echo "$(( $1 * 125 / 1024 ))k"; }                          # kbit/s -> rclone's KiB/s
+line_known_kbit() {   # the line's upload speed: the middle of the last 5 full-speed uploads; "" if none yet
+    tail -n 5 "$APP_DIR/line-speeds" 2>/dev/null | grep -E '^[0-9]+$' | sort -n |
+        awk '{ a[NR] = $1 } END { if (NR) print a[int((NR + 1) / 2)] }'
+}
+line_report() {   # "87 Mbit/s up (measured 20:40, last 5 uploads)" or "not measured yet"
+    local l n
+    l=$(line_known_kbit)
+    if [ -z "$l" ]; then echo "not measured yet"; return; fi
+    n=$(tail -n 5 "$APP_DIR/line-speeds" | grep -cE '^[0-9]+$')
+    echo "$(awk -v k="$l" 'BEGIN { if (k >= 10000) printf "%.0f", k / 1000; else printf "%.1f", k / 1000 }') Mbit/s up (measured $(clock_of "$(mtime "$APP_DIR/line-speeds")" '%H:%M'), last $(plural "$n" upload uploads))"
+}
+cap_min() { kbit_of "$LIVE_UPLOAD_MIN_MBIT"; }
+reserve() { kbit_of "$LIVE_STREAM_RESERVE_MBIT"; }
+ceiling_kbit() {   # the lowest of the hard cap, LIVE_LINE_SHARE% of the line, and the line less the reserve; at least the minimum
+    local l c q lo hard
+    l=$(line_known_kbit); lo=$(cap_min)
+    if [ -z "$l" ]; then
+        c=$(kbit_of "$LIVE_UNKNOWN_MAX_MBIT")
+    else
+        c=$(( l * LIVE_LINE_SHARE / 100 ))
+        q=$(( l - $(reserve) )); if [ "$q" -lt "$c" ]; then c=$q; fi
+    fi
+    if [ -n "$LIVE_UPLOAD_MAX_MBIT" ]; then hard=$(kbit_of "$LIVE_UPLOAD_MAX_MBIT"); if [ "$c" -gt "$hard" ]; then c=$hard; fi; fi
+    if [ "$c" -lt "$lo" ]; then c=$lo; fi
+    echo "$c"
+}
+ping_host() {   # 5 pings; one line per reply, its time in ms
+    if [ "$(uname)" = "Darwin" ]; then "$PING" -c 5 -t 8 "$1"; else "$PING" -c 5 -w 8 "$1"; fi 2>/dev/null |
+        sed -nE 's/.*time[=<]([0-9.]+) ?ms.*/\1/p'
+}
+measure_line() {   # sets LAT (middle delay in ms, "" if nothing came back) and LOSS (% of pings lost)
+    local h i=0 pids="" p n total
+    for h in $PING_HOSTS; do ping_host "$h" > "$APP_DIR/ping.$i" & pids="$pids $!"; i=$((i + 1)); done
+    for p in $pids; do wait "$p" 2>/dev/null; done
+    cat "$APP_DIR"/ping.[0-9]* > "$APP_DIR/pings" 2>/dev/null; rm -f "$APP_DIR"/ping.[0-9]*
+    total=$(( i * 5 )); n=$(grep -c . "$APP_DIR/pings" 2>/dev/null || true); n=${n:-0}
+    LOSS=0
+    if [ "$total" -gt 0 ] && [ "$n" -lt "$total" ]; then LOSS=$(( (total - n) * 100 / total )); fi
+    LAT=$(sort -n "$APP_DIR/pings" 2>/dev/null | awk '{ a[NR] = $1 } END { if (NR) printf "%d", a[int((NR + 1) / 2)] + 0.5 }')
+}
+live_name() { echo "${1%.*}"; }   # "Salsabeel live 2026-11-07 18-02.mp4" -> "Salsabeel live 2026-11-07 18-02"
+current_file() {   # the first file of this upload not yet in Google Drive
+    local f
+    while IFS= read -r f; do if [ -e "$READY/$f" ]; then basename "$f"; return; fi; done < "$APP_DIR/to-upload"
+}
+RC_URL=""
+rc_bwlimit() {   # change rclone's speed while it runs (its remote control, local only, file actions refused)
+    if [ -z "$RC_URL" ]; then
+        RC_URL=$(sed -nE 's#.*Serving remote control on (http://127\.0\.0\.1:[0-9]+/).*#\1#p' "$PROGRESS" 2>/dev/null | head -n 1)
+    fi
+    [ -n "$RC_URL" ] && "$RCLONE" rc --url "$RC_URL" --timeout 10s core/bwlimit "rate=$1" >/dev/null 2>&1
+}
+full_rate() { echo "${BWLIMIT:-off}"; }
+status_slow() {   # percent "done / total" eta
+    local detail="$(human_size "${2% / *}") of $(human_size "${2#* / }") · $(mbit_of "$cap") Mbit/s"
+    write_status uploading "Uploading slowly" "Uploading slowly during the live" \
+        "A live is on, so this uploads slowly and keeps the stream smooth. Leave the Mac on." "$1" "$detail" "Uploading slowly $1% · Salsabeel"
+    NOW_LINE="A live is on: uploading slowly ($(mbit_of "$cap") Mbit/s), $(live_name "$(current_file)") $1%"
+}
+status_guarded() {   # minutes
+    write_status retry "Paused for the stream" "Upload paused to protect the stream" \
+        "The internet looked busy, so the upload stopped for a few minutes to keep the live smooth. It carries on by itself." \
+        "${pct:-0}" "Back in about $1 minutes" "Paused · Salsabeel"
+    NOW_LINE="A live is on: upload paused to protect the stream (back in $1 min)"
+}
+
+note_sleep() {   # the Mac slept (or was off) between runs while lives were waiting: say so
+    local n gap fmt
+    [ -n "$PREV_RUN" ] || return 0
+    gap=$(( $(date +%s) - PREV_RUN ))
+    [ "$gap" -ge "$SLEEP_GAP_SECONDS" ] || return 0
+    n=$(cat "$APP_DIR/waiting-count" 2>/dev/null); n=${n:-0}
+    [ "$n" -gt 0 ] 2>/dev/null || return 0
+    fmt='%H:%M'; if [ "$gap" -ge 72000 ]; then fmt='%a %d %b %H:%M'; fi
+    echo "the Mac slept from $(clock_of "$PREV_RUN" "$fmt") to $(clock_of "$(date +%s)" "$fmt") with $(plural "$n" "live" "lives") waiting" > "$APP_DIR/last-sleep"
+    log "Asleep: $(cat "$APP_DIR/last-sleep"). Please leave the laptop open after the last live until uploads say Done."
+    STATUS_NOW=1
+}
+clock_of() { if [ "$(uname)" = "Darwin" ]; then date -r "$1" "+$2"; else date -d "@$1" "+$2"; fi; }
+if [ "${1:-}" = "--live-ceiling" ]; then mbit_of "$(ceiling_kbit)"; exit 0; fi   # (for the self-test)
 if [ "${1:-}" = "--status-now" ]; then send_status; exit $?; fi
+note_sleep
 
 # One copy at a time (launchd already avoids overlaps; this covers a manual run as well).
 PIDFILE="$APP_DIR/running.pid"
@@ -453,7 +555,8 @@ take_if_finished() {   # path [since]: a stopped recording goes into "Ready to u
     return 1
 }
 live_studio_videos() {   # the video files LIVE Studio is recording to right now (app caches left out)
-    local pids p
+    local pids p t                # only in the recording folder, or growing: scene media it merely holds open is not a live
+    t=$(date +%s)
     pids=$(ps -axo pid=,args= 2>/dev/null | awk -v m="$RECORDER" '{ l = tolower($0) }
                l ~ m && l !~ /^ *[0-9]+ awk / && l !~ /rclone|upload-lives|fix salsabeel/ { print $1 }' | paste -sd, -)
     [ -n "$pids" ] || return 0
@@ -463,16 +566,24 @@ live_studio_videos() {   # the video files LIVE Studio is recording to right now
         if [ -z "${SALSABEEL_UPLOADER_TEST:-}" ]; then   # macOS's temporary folders (the self-test works in one)
             case "$p" in /private/var/folders/*|/var/folders/*) continue ;; esac
         fi
-        echo "$p"
+        case "$p" in "$WATCH_DIR"/*) echo "$p"; continue ;; esac
+        if grep -qxF -- "$p" "$FOLLOW" 2>/dev/null || [ $(( t - $(mtime "$p") )) -lt 90 ]; then echo "$p"; fi
     done
 }
 recording_now() {   # is a live on? LIVE Studio has a recording open, or a recording changed in the last 90 seconds
-    local f t
-    if [ -n "$(live_studio_videos)" ]; then return 0; fi
-    t=$(date +%s)
-    while IFS= read -r f; do
-        if [ -f "$f" ] && [ $(( t - $(mtime "$f") )) -lt 90 ]; then return 0; fi
-    done < <(recordings; if [ -s "$FOLLOW" ]; then cat "$FOLLOW"; fi)
+    local f t on=""
+    on=$(live_studio_videos | head -n 1)
+    if [ -z "$on" ]; then
+        t=$(date +%s)
+        while IFS= read -r f; do
+            if [ -f "$f" ] && [ $(( t - $(mtime "$f") )) -lt 90 ]; then on=$f; break; fi
+        done < <(recordings; if [ -s "$FOLLOW" ]; then cat "$FOLLOW"; fi)
+    fi
+    if [ -n "$on" ]; then
+        if [ ! -f "$APP_DIR/live-on" ]; then echo "$on" > "$APP_DIR/live-on"; log "Live started (file \"$on\")."; fi
+        return 0
+    fi
+    if [ -f "$APP_DIR/live-on" ]; then log "Live stopped (\"$(cat "$APP_DIR/live-on")\")."; rm -f "$APP_DIR/live-on"; fi
     return 1
 }
 follow_live_studio() {   # video files LIVE Studio has open outside the recording folder
@@ -530,68 +641,10 @@ fi
 rescue_moved
 clear_copied
 
-# --- Uploading during a live -------------------------------------------------------------------------
-kbit_of() { awk -v m="$1" 'BEGIN { printf "%d", m * 1000 }'; }        # "1.5" Mbit/s -> 1500 kbit/s
-mbit_of() { awk -v k="$1" 'BEGIN { printf "%.1f", k / 1000 }'; }      # 1500 kbit/s -> "1.5"
-rate_of() { echo "$(( $1 * 125 / 1024 ))k"; }                          # kbit/s -> rclone's KiB/s
-line_kbit() {   # the line's upload speed: the middle of the last 5 measured
-    local m
-    m=$(tail -n 5 "$APP_DIR/line-speeds" 2>/dev/null | grep -E '^[0-9]+$' | sort -n |
-        awk '{ a[NR] = $1 } END { if (NR) print a[int((NR + 1) / 2)] }')
-    echo "${m:-$(kbit_of "$LINE_DEFAULT_MBIT")}"
-}
-cap_min() { kbit_of "$LIVE_UPLOAD_MIN_MBIT"; }
-cap_max() { kbit_of "$LIVE_UPLOAD_MAX_MBIT"; }
-start_cap() {   # a tenth of the line, kept between the minimum and the maximum
-    local c lo hi
-    c=$(( $(line_kbit) / 10 )); lo=$(cap_min); hi=$(cap_max)
-    if [ "$c" -lt "$lo" ]; then c=$lo; fi
-    if [ "$c" -gt "$hi" ]; then c=$hi; fi
-    echo "$c"
-}
-ping_host() {   # 5 pings; one line per reply, its time in ms
-    if [ "$(uname)" = "Darwin" ]; then "$PING" -c 5 -t 8 "$1"; else "$PING" -c 5 -w 8 "$1"; fi 2>/dev/null |
-        sed -nE 's/.*time[=<]([0-9.]+) ?ms.*/\1/p'
-}
-measure_line() {   # sets LAT (middle delay in ms, "" if nothing came back) and LOSS (% of pings lost)
-    local h i=0 pids="" p n total
-    for h in $PING_HOSTS; do ping_host "$h" > "$APP_DIR/ping.$i" & pids="$pids $!"; i=$((i + 1)); done
-    for p in $pids; do wait "$p" 2>/dev/null; done
-    cat "$APP_DIR"/ping.[0-9]* > "$APP_DIR/pings" 2>/dev/null; rm -f "$APP_DIR"/ping.[0-9]*
-    total=$(( i * 5 )); n=$(grep -c . "$APP_DIR/pings" 2>/dev/null || true); n=${n:-0}
-    LOSS=0
-    if [ "$total" -gt 0 ] && [ "$n" -lt "$total" ]; then LOSS=$(( (total - n) * 100 / total )); fi
-    LAT=$(sort -n "$APP_DIR/pings" 2>/dev/null | awk '{ a[NR] = $1 } END { if (NR) printf "%d", a[int((NR + 1) / 2)] + 0.5 }')
-}
-live_name() { echo "${1%.*}"; }   # "Salsabeel live 2026-11-07 18-02.mp4" -> "Salsabeel live 2026-11-07 18-02"
-current_file() {   # the first file of this upload not yet in Google Drive
-    local f
-    while IFS= read -r f; do if [ -e "$READY/$f" ]; then basename "$f"; return; fi; done < "$APP_DIR/to-upload"
-}
-RC_URL=""
-rc_bwlimit() {   # change rclone's speed while it runs (its remote control, local only, file actions refused)
-    if [ -z "$RC_URL" ]; then
-        RC_URL=$(sed -nE 's#.*Serving remote control on (http://127\.0\.0\.1:[0-9]+/).*#\1#p' "$PROGRESS" 2>/dev/null | head -n 1)
-    fi
-    [ -n "$RC_URL" ] && "$RCLONE" rc --url "$RC_URL" --timeout 10s core/bwlimit "rate=$1" >/dev/null 2>&1
-}
-full_rate() { echo "${BWLIMIT:-off}"; }
-status_slow() {   # percent "done / total" eta
-    local detail="$(human_size "${2% / *}") of $(human_size "${2#* / }") · $(mbit_of "$cap") Mbit/s"
-    write_status uploading "Uploading slowly" "Uploading slowly during the live" \
-        "A live is on, so this uploads slowly and keeps the stream smooth. Leave the Mac on." "$1" "$detail" "Uploading slowly $1% · Salsabeel"
-    NOW_LINE="A live is on: uploading slowly ($(mbit_of "$cap") Mbit/s), $(live_name "$(current_file)") $1%"
-}
-status_guarded() {   # minutes
-    write_status retry "Paused for the stream" "Upload paused to protect the stream" \
-        "The internet looked busy, so the upload stopped for a few minutes to keep the live smooth. It carries on by itself." \
-        "${pct:-0}" "Back in about $1 minutes" "Paused · Salsabeel"
-    NOW_LINE="A live is on: upload paused to protect the stream (back in $1 min)"
-}
-
 pending() { find "$READY" -type f ! -name '.*' 2>/dev/null; }
 label() { pending | while IFS= read -r f; do basename "$f"; done | paste -sd ',' - | sed 's/,/, /g'; }
 waiting=$(pending | grep -c . || true)
+echo "$waiting" > "$APP_DIR/waiting-count"
 if [ "$waiting" -eq 0 ]; then
     if recording_now; then NOW_LINE="A live is on: nothing waits to upload"; BUSY=1; fi
     status_if_due; exit 0
@@ -622,8 +675,9 @@ if [ -z "$LIVE" ] && { [ "$finished" -gt 0 ] || [ "$(cat "$APP_DIR/page-opened-b
 fi
 
 # Never overwrite a recording already in Google Drive: a clash gets " (2)", " (3)" and so on.
-existing=$("$RCLONE" lsf "$DEST" --files-only 2>/dev/null) ||
-    { "$RCLONE" mkdir "$DEST" >/dev/null 2>&1 && existing=$("$RCLONE" lsf "$DEST" --files-only 2>/dev/null); } ||
+existing=$("$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 30s 2>/dev/null) ||
+    { "$RCLONE" mkdir "$DEST" --contimeout 15s --timeout 30s >/dev/null 2>&1 &&
+      existing=$("$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 30s 2>/dev/null); } ||
     { log "Google Drive is not reachable; trying again in a minute."; status_retry 0; NOW_LINE="Waiting for the internet"; status_if_due; exit 0; }
 taken() { printf '%s\n' "$existing" | grep -Fxq -- "$1"; }
 for f in "$READY"/*; do
@@ -675,14 +729,14 @@ args=(move "$READY" "$DEST" --files-from "$APP_DIR/to-upload" --transfers 1 --re
       --rc --rc-addr 127.0.0.1:0)   # its remote control: local only, and file actions need a password it hasn't got
 guard=""
 if [ -n "$LIVE" ]; then
-    measure_line; base=$LAT   # the line's delay with the stream on, before this adds to it
-    cap=$(cap_min)   # it starts at the minimum, and goes up to "target" once it knows it can slow down again
+    measure_line; base=$LAT   # the baseline: the line's delay with the stream on, while this sends nothing
+    cap=$(cap_min); limit=$(ceiling_kbit)   # it starts at the minimum and climbs to the ceiling while the stream is fine
     if [ -n "$base" ]; then
-        guard=1; target=$(start_cap)
-        log "A live is on: uploading $(live_name "$(head -n 1 "$APP_DIR/to-upload" | sed 's#.*/##')") slowly, at $(mbit_of "$cap") Mbit/s, then $(mbit_of "$target") (the line's delay is ${base} ms)."
+        guard=1
+        log "A live is on: uploading $(live_name "$(head -n 1 "$APP_DIR/to-upload" | sed 's#.*/##')") at $(mbit_of "$cap") Mbit/s, up to $(mbit_of "$limit")."
+        log "The line's delay is ${base} ms (measured while not uploading)."
     else
-        target=$cap   # no pings come back here, so it can't watch the line: the minimum, never raised
-        log "A live is on: uploading slowly, at $(mbit_of "$cap") Mbit/s. (Pings get no answer here, so it stays at that.)"
+        log "A live is on: uploading at $(mbit_of "$cap") Mbit/s. (Pings get no answer here, so it can't watch the line, and stays at that.)"
     fi
     args+=(--bwlimit "$(rate_of "$cap")")
     mode=live
@@ -720,18 +774,22 @@ checked=$(date +%s); good_since=$checked; bad=0
 while kill -0 "$rclone_pid" 2>/dev/null; do
     ticks=$((ticks + 1))
     now_s=$(date +%s)
-    if [ $((ticks % 15)) -eq 0 ]; then   # a new version takes over now, not after a long upload
+    if [ $((ticks % 15)) -eq 0 ]; then   # a new version takes over now, not after a long upload ...
         UPDATED=""
         update_if_due
-        if [ -n "$UPDATED" ]; then stop_upload; restart=1; break; fi
+        if [ -n "$UPDATED" ]; then
+            if [ "$mode" = full ]; then stop_upload; restart=1; break; fi
+            # ... but not during a live: starting a slow upload again from the beginning would cost hours
+            log "The new version takes over after this upload (a live is on, so it is not started again)."
+        fi
     fi
     if [ $((ticks % 8)) -eq 0 ]; then
         if [ "$mode" = full ] && recording_now; then   # a live has started
             full_only=""
             if [ "$LIVE_UPLOAD" = on ] && set_cap "$(cap_min)" "a live started"; then   # (rclone answers only while running)
                 kill -STOP "$rclone_pid" 2>/dev/null; measure_line; kill -CONT "$rclone_pid" 2>/dev/null
-                base=$LAT; guard=$([ -n "$base" ] && echo 1); target=$([ -n "$base" ] && start_cap || cap_min)
-                log "The line's delay is ${base:-unknown} ms with the live on."
+                base=$LAT; guard=$([ -n "$base" ] && echo 1); limit=$(ceiling_kbit)
+                log "The line's delay is ${base:-unknown} ms (measured while not uploading)."
                 mode=live; BUSY=1; checked=$(date +%s); good_since=$checked; bad=0
             fi
             if [ "$mode" = full ]; then   # it can't slow down: stop, and carry on after the live (or slowly next minute)
@@ -749,30 +807,36 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
     fi
     if [ -n "$held" ]; then
         if [ "$now_s" -ge "$held" ]; then   # try again, at the minimum
-            measure_line; base=${LAT:-$base}
+            measure_line; base=${LAT:-$base}   # the only time the baseline is measured again: nothing is being sent
             kill -CONT "$rclone_pid" 2>/dev/null; held=""   # it carries on gently (see hold), then the minimum
             if rc_bwlimit "$(rate_of "$(cap_min)")"; then cap=$(cap_min); fi
-            log "Carrying on with the upload at $(mbit_of "$cap") Mbit/s (the line's delay is ${LAT:-unknown} ms)."
+            log "The line's delay is ${LAT:-unknown} ms (measured while not uploading)."
+            log "Carrying on with the upload at $(mbit_of "$cap") Mbit/s."
             checked=$(date +%s); good_since=$checked; bad=0
         else
             status_guarded $(( (held - now_s + 59) / 60 ))
         fi
-    elif [ "$mode" = live ] && [ -n "$guard" ] && [ $(( now_s - checked )) -ge "$LIVE_GUARD_EVERY" ]; then
+    elif [ "$mode" = live ] && [ -n "$guard" ] &&
+         [ $(( now_s - checked )) -ge "$([ "$cap" -gt 4000 ] && echo "$LIVE_GUARD_FAST_EVERY" || echo "$LIVE_GUARD_EVERY")" ]; then
         measure_line; checked=$(date +%s)
-        if [ -z "$LAT" ] || [ $(( LAT - base )) -gt "$LIVE_GUARD_MS" ] || [ "$LOSS" -gt "$LIVE_GUARD_LOSS" ]; then
+        if [ -z "$LAT" ] || [ $(( LAT - base )) -ge "$LIVE_GUARD_MS" ] || [ "$LOSS" -gt "$LIVE_GUARD_LOSS" ]; then
             why="delay ${LAT:-unknown} ms against ${base} ms, ${LOSS}% of pings lost"
-            if [ "$bad" -gt 0 ] || [ $(( cap / 2 )) -lt "$LIVE_UPLOAD_FLOOR_KBIT" ] || ! set_cap $(( cap / 2 )) "halved: $why"; then
+            bad=$((bad + 1)); good_since=$checked
+            low=$(( cap * 4 / 5 )); if [ "$low" -lt "$(cap_min)" ]; then low=$(cap_min); fi
+            if [ "$low" -lt "$limit" ]; then limit=$low; fi   # stay below where the trouble began, for a while
+            if [ "$bad" -eq 1 ] && [ $(( cap / 2 )) -ge "$LIVE_UPLOAD_FLOOR_KBIT" ] && set_cap $(( cap / 2 )) "halved: $why"; then :
+            elif [ "$bad" -eq 2 ] && [ "$cap" -gt "$(cap_min)" ] && set_cap "$(cap_min)" "back to the minimum: $why"; then :
+            else
                 hold "$why"; status_guarded $(( (LIVE_PAUSE_SECONDS + 59) / 60 ))
             fi
-            bad=1; good_since=$checked
         else
             bad=0
-            if [ "$cap" -lt "$target" ]; then   # the first good check: up to the starting speed (only if it can come down)
-                set_cap "$target" "its starting speed: a tenth of the line's $(mbit_of "$(line_kbit)") Mbit/s" || true
-                target=$cap
-            elif [ $(( checked - good_since )) -ge "$LIVE_GOOD_SECONDS" ] && [ "$cap" -lt "$(cap_max)" ]; then
-                up=$(( cap * 5 / 4 )); if [ "$up" -gt "$(cap_max)" ]; then up=$(cap_max); fi
-                set_cap "$up" "the stream has been fine for $(( LIVE_GOOD_SECONDS / 60 )) minutes"
+            top=$(ceiling_kbit)
+            if [ "$limit" -gt "$top" ]; then limit=$top; fi
+            if [ "$limit" -lt "$top" ] && [ $(( checked - good_since )) -ge "$LIVE_RELAX_SECONDS" ]; then limit=$top; fi
+            if [ "$cap" -lt "$limit" ] && [ $(( checked - good_since )) -ge "$LIVE_RAMP_SECONDS" ]; then
+                up=$(( cap * 5 / 4 )); if [ "$up" -gt "$limit" ]; then up=$limit; fi
+                set_cap "$up" "fine for $(( checked - good_since )) s, ceiling $(mbit_of "$limit")" || true
                 good_since=$checked
             fi
         fi
@@ -823,7 +887,7 @@ elif wait "$rclone_pid"; then
     if [ -n "$full_only" ] && [ "$total" -ge $(( 50 * 1048576 )) ] && [ "$secs" -ge 20 ]; then   # the line's speed
         echo $(( total * 8 / 1000 / secs )) >> "$APP_DIR/line-speeds"
         tail -n 5 "$APP_DIR/line-speeds" > "$APP_DIR/line-speeds.new"; mv -f "$APP_DIR/line-speeds.new" "$APP_DIR/line-speeds"
-        log "The line's upload speed was $(mbit_of $(( total * 8 / 1000 / secs ))) Mbit/s (now taken as $(mbit_of "$(line_kbit)"))."
+        log "The line's upload speed was $(mbit_of $(( total * 8 / 1000 / secs ))) Mbit/s (the line: $(line_report); so up to $(mbit_of "$(ceiling_kbit)") during lives)."
     fi
     status_done
     if [ "$mode" = full ]; then notify "The live recording is in Google Drive. You can turn the Mac off."; fi

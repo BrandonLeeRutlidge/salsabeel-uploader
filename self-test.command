@@ -138,8 +138,9 @@ installed; setup "$DRIVE" "UPDATE_URL=file://$SITE"; publish v1
 bash "$ROOT/app/upload-lives.sh"; bash "$ROOT/app/upload-lives.sh"
 check "a new version on the website is picked up, and runs from the next minute" \
       '[ "$(cat "$ROOT/app/VERSION")" = v1 ] && [ "$(cat "$ROOT/ran" 2>/dev/null)" = v1 ]'
-check "it is checked for once an hour, not every minute" \
-      '[ -f "$ROOT/app/update-checked" ] && publish v2 && bash "$ROOT/app/upload-lives.sh" && [ "$(cat "$ROOT/app/VERSION")" = v1 ]'
+check "it is checked for every 10 minutes, not every minute" \
+      '[ -f "$ROOT/app/update-checked" ] && publish v2 && agos "$ROOT/app/update-checked" 540 && bash "$ROOT/app/upload-lives.sh" && [ "$(cat "$ROOT/app/VERSION")" = v1 ] &&
+       agos "$ROOT/app/update-checked" 610 && bash "$ROOT/app/upload-lives.sh" && [ "$(cat "$ROOT/app/VERSION")" = v2 ]'
 installed; publish v3; echo "# changed after the manifest was made" >> "$SITE/upload-lives.sh"
 bash "$ROOT/app/upload-lives.sh"
 check "a download that does not match its checksum is not used" '[ "$(cat "$ROOT/app/VERSION")" = v0 ] && cmp -s upload-lives.sh "$ROOT/app/upload-lives.sh"'
@@ -185,13 +186,24 @@ setup "$DRIVE"
 mkdir -p "$ROOT/fakerec$$x" "$ROOT/elsewhere"
 printf '#!/bin/bash\nexec 3>>"%s"\nwhile :; do sleep 1 3>&-; done\n' "$ROOT/elsewhere/live.mp4" > "$ROOT/fakerec$$x/rec"
 bash "$ROOT/fakerec$$x/rec" & recpid=$!
-sleep 1; head -c 4096 /dev/zero >> "$ROOT/elsewhere/live.mp4"; ago "$ROOT/elsewhere/live.mp4" 10
+sleep 1; head -c 4096 /dev/zero >> "$ROOT/elsewhere/live.mp4"   # (growing: written just now)
 bash "$ROOT/app/upload-lives.sh"
 check "LIVE Studio recording somewhere else: it notices, and leaves it alone while it records" \
       'grep -qxF "$ROOT/elsewhere/live.mp4" "$ROOT/app/following" && [ -e "$ROOT/elsewhere/live.mp4" ]'
-kill "$recpid"; wait "$recpid" 2>/dev/null; sleep 1
+kill "$recpid"; wait "$recpid" 2>/dev/null; sleep 1; ago "$ROOT/elsewhere/live.mp4" 10
 bash "$ROOT/app/upload-lives.sh"
 check "once that recording stops, it is uploaded too" '[ ! -e "$ROOT/elsewhere/live.mp4" ] && [ ! -s "$ROOT/app/following" ]'
+
+# Scene media LIVE Studio merely holds open (an intro clip, a looping background) is not a live
+mkdir -p "$ROOT/scene"; head -c 4096 /dev/zero > "$ROOT/scene/intro.mp4"; ago "$ROOT/scene/intro.mp4" 30
+printf '#!/bin/bash\nexec 3<"%s"\nwhile :; do sleep 1 3>&-; done\n' "$ROOT/scene/intro.mp4" > "$ROOT/fakerec$$x/rec"
+bash "$ROOT/fakerec$$x/rec" & recpid=$!; sleep 1
+head -c 4096 /dev/zero > "$REC/during_break.mp4"; ago "$REC/during_break.mp4" 10
+before=$(count "$DRIVE" "Salsabeel live *.mp4"); : > "$ROOT/test.log"
+bash "$ROOT/app/upload-lives.sh"
+check "LIVE Studio holding a still video open (scene media, in a break) is not a live: it uploads at full speed" \
+      '[ "$(count "$DRIVE" "Salsabeel live *.mp4")" = $((before + 1)) ] && ! grep -qE "Live started|A live is" "$ROOT/test.log" && ! grep -qF intro.mp4 "$ROOT/app/following" 2>/dev/null && [ -e "$ROOT/scene/intro.mp4" ]'
+kill "$recpid"; wait "$recpid" 2>/dev/null
 
 MOVED="$HOME/Movies/Old stuff/Salsabeel lives/Recordings/Ready to upload"
 mkdir -p "$MOVED" "$HOME/Desktop/Salsabeel lives/Recordings"
@@ -347,50 +359,95 @@ stop_live() { kill "$recpid"; wait "$recpid" 2>/dev/null; }
 LIVE7="$REC/Ready to upload/Salsabeel live 2026-11-07 18-02.mp4"
 start_live; opened_before=$(opened); : > "$ROOT/test.log"
 head -c 2500000 /dev/urandom > "$LIVE7"
-echo 30000 > "$ROOT/app/line-speeds"                     # a 30 Mbit/s line: 3 Mbit/s once it knows it can slow down
+rm -f "$ROOT/app/line-speeds" "$ROOT/app/line-learned"
 trickle_setup 'LIVE_GUARD_EVERY=2'
 agos "$ROOT/app/status-sent" 360
 t0=$(date +%s)
 bash "$ROOT/app/upload-lives.sh" & up=$!
-seen_note=""; seen_page=""
+seen_note=""; seen_page=""; seen_notice=""
 for i in $(seq 1 40); do
     kill -0 "$up" 2>/dev/null || break
     grep -qE '^Now: +A live is on: uploading slowly \([0-9.]+ Mbit/s\), Salsabeel live 2026-11-07 18-02 [0-9]+%$' "$NOTE" 2>/dev/null && seen_note=1
     grep -q "Uploading slowly during the live" "$PAGE" 2>/dev/null && seen_page=1
+    grep -q "Please leave the laptop open after the last live until uploads say Done" "$PAGE" 2>/dev/null && seen_notice=1
     sleep 1
 done
 wait "$up"; took=$(( $(date +%s) - t0 ))
-check "a live on: it uploads anyway, slowly (capped, $took seconds for 2.5 MB)" \
-      '[ ! -e "$LIVE7" ] && [ -e "$DRIVE/Salsabeel live 2026-11-07 18-02.mp4" ] && [ "$took" -ge 6 ] && grep -q "uploading Salsabeel live 2026-11-07 18-02 slowly, at 1.5 Mbit/s, then 3.0" "$ROOT/test.log"'
-check "a live on: it starts at 1.5 Mbit/s, then a tenth of the line once it can slow down again" \
-      'grep -q "Upload speed during the live: 3.0 Mbit/s (its starting speed" "$ROOT/test.log"'
+check "a live on: it uploads anyway, from 1.5 Mbit/s (capped, $took seconds for 2.5 MB)" \
+      '[ ! -e "$LIVE7" ] && [ -e "$DRIVE/Salsabeel live 2026-11-07 18-02.mp4" ] && [ "$took" -ge 6 ] && grep -q "uploading Salsabeel live 2026-11-07 18-02 at 1.5 Mbit/s, up to 4.0" "$ROOT/test.log"'
 check "a live on: the note says \"A live is on: uploading slowly (… Mbit/s), Salsabeel live 2026-11-07 18-02 …%\", and so does the page" \
       '[ -n "$seen_note" ] && [ -n "$seen_page" ]'
+check "the page asks them to leave the laptop open while lives wait, and not once they are all up" \
+      '[ -n "$seen_notice" ] && ! grep -q "Please leave the laptop open" "$PAGE"'
 check "a live on: the live recording itself is never touched, and the page never pops up" \
       '[ -e "$REC/on_air.mp4" ] && [ "$(fsize_of "$REC/on_air.mp4")" = 4096 ] && [ ! -e "$DRIVE/on_air.mp4" ] && [ "$(count "$REC/Ready to upload" "*.mp4")" = 0 ] && [ "$(opened)" = "$opened_before" ]'
 
-# The latency guard: slower at once when the line's delay jumps, a pause if it stays bad, then back up
-rm -f "$ROOT/app/line-speeds"; : > "$ROOT/test.log"
-head -c 4000000 /dev/urandom > "$LIVE7"
-printf '20 0\n200 0\n20 3\n20 0\n' > "$ROOT/ping-seq"     # baseline; 180 ms worse; 3 of 5 lost; fine from then on
-trickle_setup 'LIVE_GUARD_EVERY=2
+# The ceiling: the lowest of 20 Mbit/s, 40% of the line, and the line less 10; at least 1.5; 4 until the line is known
+ceiling() { rm -f "$ROOT/app/line-learned"; if [ -n "$1" ]; then echo "$1" > "$ROOT/app/line-speeds"; else rm -f "$ROOT/app/line-speeds"; fi
+            trickle_setup "$2"; bash "$ROOT/app/upload-lives.sh" --live-ceiling; }
+c900=$(ceiling 900000); c40=$(ceiling 40000); c15=$(ceiling 15000); c0=$(ceiling ""); c5=$(ceiling 5000); c900nocap=$(ceiling 900000 'LIVE_UPLOAD_MAX_MBIT=""')
+check "the ceiling: a 900 Mbit/s line gives 20, 40 gives 16, 15 gives 5, unknown 4, 5 gives 1.5, 900 with no hard cap 360 ($c900 $c40 $c15 $c0 $c5 $c900nocap)" \
+      '[ "$c900 $c40 $c15 $c0 $c5 $c900nocap" = "20.0 16.0 5.0 4.0 1.5 360.0" ]'
+
+# The ramp: 25% faster after each quiet spell (2 minutes; 1 second here), up to the ceiling
+: > "$ROOT/test.log"; echo 20000 > "$ROOT/app/line-speeds"
+head -c 20000000 /dev/urandom > "$LIVE7"
+trickle_setup 'LIVE_RAMP_SECONDS=1
+LIVE_GUARD_EVERY=1
+LIVE_GUARD_FAST_EVERY=1'
+bash "$ROOT/app/upload-lives.sh" & up=$!
+for i in $(seq 1 90); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
+steps=$(grep -c "Upload speed during the live: .* (fine for" "$ROOT/test.log")
+check "the ramp: with the stream fine, it climbs 25% at a time from 1.5 to the ceiling (8 on a 20 Mbit/s line; $steps steps), never past it" \
+      '! kill -0 "$up" 2>/dev/null && grep -q "Upload speed during the live: 8.0 Mbit/s (fine for" "$ROOT/test.log" && [ "$steps" = 8 ] && [ ! -e "$LIVE7" ]'
+kill "$up" 2>/dev/null
+
+# Fast back-off: one bad reading halves, two drop to 1.5, three pause; the baseline is only measured while nothing is sent
+: > "$ROOT/test.log"; echo 20000 > "$ROOT/app/line-speeds"; rm -f "$ROOT/app/line-learned"
+head -c 6000000 /dev/urandom > "$LIVE7"
+printf '20 0\n20 0\n60 0\n20 0\n20 0\n75 0\n75 0\n20 3\n20 0\n' > "$ROOT/ping-seq"   # 60 = only 40 ms worse: still fine
+trickle_setup 'LIVE_RAMP_SECONDS=1
+LIVE_GUARD_EVERY=1
+LIVE_GUARD_FAST_EVERY=1
 LIVE_PAUSE_SECONDS=6
-LIVE_GOOD_SECONDS=6'
+LIVE_RELAX_SECONDS=999'
 bash "$ROOT/app/upload-lives.sh" & up=$!
 seen_held=""
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
     kill -0 "$up" 2>/dev/null || break
     grep -q "Upload paused to protect the stream" "$PAGE" 2>/dev/null && seen_held=1
     sleep 1
 done
 wait "$up"
-order=$(grep -oE "0\.8 Mbit/s \(halved|Upload stopped for|Carrying on with the upload at 1\.5|1\.9 Mbit/s \(the stream has been fine" "$ROOT/test.log" | paste -sd '|' -)
-check "the guard: the delay jumps, so the speed halves at once" 'grep -q "0.8 Mbit/s (halved: delay 200 ms against 20 ms" "$ROOT/test.log"'
-check "the guard: still bad (pings lost), so it stops for a while, and the page says so" \
+order=$(grep -oE "3\.7 Mbit/s \(fine|1\.8 Mbit/s \(halved|1\.5 Mbit/s \(back to the minimum|Upload stopped for|measured while not uploading|Carrying on with the upload at 1\.5" "$ROOT/test.log" | paste -sd '|' -)
+check "back-off: one bad reading (55 ms worse) halves at once, the next drops to 1.5" \
+      'grep -q "1.8 Mbit/s (halved: delay 75 ms against 20 ms" "$ROOT/test.log" && grep -q "1.5 Mbit/s (back to the minimum: delay 75 ms against 20 ms" "$ROOT/test.log"'
+check "back-off: a third bad reading (pings lost) pauses, and the page says so" \
       'grep -q "Upload stopped for .* to protect the stream (delay 20 ms against 20 ms, 60% of pings lost)" "$ROOT/test.log" && [ -n "$seen_held" ]'
-check "the guard: it carries on at the minimum, goes 25% faster after good minutes, and finishes" \
-      '[ "$order" = "0.8 Mbit/s (halved|Upload stopped for|Carrying on with the upload at 1.5|1.9 Mbit/s (the stream has been fine" ] && [ ! -e "$LIVE7" ]'
+check "the baseline is measured only while nothing is sent: at the start and during the pause" \
+      '[ "$order" = "measured while not uploading|3.7 Mbit/s (fine|1.8 Mbit/s (halved|1.5 Mbit/s (back to the minimum|Upload stopped for|measured while not uploading|Carrying on with the upload at 1.5" ] && [ ! -e "$LIVE7" ]'
 rm -f "$ROOT/ping-seq"
+
+# The line's speed, for Brandon: in the note and on the page
+bash "$ROOT/app/upload-lives.sh" --status-now
+check "the note says the line's speed: \"Line: 20 Mbit/s up (measured …, last 1 upload)\", and so does the page" \
+      'grep -qE "^Line: +20 Mbit/s up \(measured [0-9]{2}:[0-9]{2}, last 1 upload\)$" "$NOTE" && grep -q "Line: 20 Mbit/s up" "$PAGE"'
+rm -f "$ROOT/app/line-speeds"
+bash "$ROOT/app/upload-lives.sh" --status-now
+check "not measured yet: the note says so" 'grep -qE "^Line: +not measured yet$" "$NOTE"'
+
+# A new version during a live upload: it is installed, but the upload is not started again
+: > "$ROOT/test.log"; SITE="$ROOT/site-live"; mkdir -p "$SITE"; publish vL1; echo vL1 > "$ROOT/app/VERSION"
+head -c 8000000 /dev/urandom > "$LIVE7"
+trickle_setup "UPDATE_URL=file://$SITE
+UPDATE_EVERY=20"
+agos "$ROOT/app/update-checked" 100
+bash "$ROOT/app/upload-lives.sh" & up=$!
+sleep 5; publish vL2                                     # a new version appears while it uploads
+for i in $(seq 1 120); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
+check "a new version during a live upload: installed, but the slow upload carries on to the end" \
+      '[ "$(cat "$ROOT/app/VERSION")" = vL2 ] && grep -q "takes over after this upload" "$ROOT/test.log" && ! grep -q "Updated mid-upload" "$ROOT/test.log" && [ ! -e "$LIVE7" ] && grep -q "Uploaded to" "$ROOT/test.log"'
+kill "$up" 2>/dev/null; cp upload-lives.sh status-page.html "$ROOT/app/"
 
 # A live starts mid-upload: it slows down without starting again; the live ends: full speed at once
 : > "$ROOT/test.log"; stop_live; rm -f "$REC/on_air.mp4"
@@ -403,9 +460,36 @@ sleep 3; stop_live; ago "$REC/on_air.mp4" 10
 for i in $(seq 1 60); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
 check "a live starts mid-upload: it slows to 1.5 Mbit/s without starting the file again" \
       'grep -q "Upload speed during the live: 1.5 Mbit/s (a live started" "$ROOT/test.log" && ! grep -q "upload stopped" "$ROOT/test.log"'
+check "it logs \"Live started (file …)\" and \"Live stopped\"" \
+      'grep -q "Live started (file \"$REC/on_air.mp4\")" "$ROOT/test.log" && grep -q "Live stopped (" "$ROOT/test.log"'
 check "the live ends: back to full speed at once, and the upload finishes" \
       '! kill -0 "$up" 2>/dev/null && grep -q "The live has ended: uploading at full speed." "$ROOT/test.log" && [ ! -e "$LIVE7" ] && grep -q "Uploaded to" "$ROOT/test.log"'
 kill "$up" 2>/dev/null; rm -f "$REC/on_air.mp4"
+setup "$DRIVE"
+
+# The lid shut with lives waiting: the note says the Mac slept, and when
+setup "$DRIVE"; echo 12 > "$ROOT/app/waiting-count"; agos "$ROOT/app/last-run" 39600; rm -f "$ROOT/app/status-sent" "$ROOT/app/last-sleep"
+bash "$ROOT/app/upload-lives.sh"
+check "the Mac slept with 12 lives waiting: logged, and in the note (\"Asleep: the Mac slept from … to … with 12 lives waiting\")" \
+      'grep -q "Asleep: the Mac slept from .* with 12 lives waiting" "$ROOT/test.log" && grep -qE "^Asleep: +the Mac slept from [0-9]{2}:[0-9]{2} to [0-9]{2}:[0-9]{2} with 12 lives waiting$" "$NOTE"'
+echo 0 > "$ROOT/app/waiting-count"; agos "$ROOT/app/last-run" 39600; rm -f "$ROOT/app/last-sleep"
+bash "$ROOT/app/upload-lives.sh"
+check "asleep with nothing waiting: nothing to say" '[ ! -e "$ROOT/app/last-sleep" ]'
+
+# The morning: switched on with lives waiting and every check due, the first upload starts at once (and keeps the Mac awake)
+mkdir -p "$ROOT/bin"; printf '#!/bin/bash\necho "$*" >> "%s"\n' "$ROOT/caffeinated" > "$ROOT/bin/caffeinate"; chmod +x "$ROOT/bin/caffeinate"
+SITE="$ROOT/site-am"; mkdir -p "$SITE"; publish vAM; echo vAM > "$ROOT/app/VERSION"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=%q\n' "$REC" "$DRIVE" "$ROOT/trickle-rclone" "file://$SITE" > "$ROOT/app/config.sh"
+for f in update-checked moved-checked cleared-checked last-run; do agos "$ROOT/app/$f" 39600; done
+echo 3 > "$ROOT/app/waiting-count"; : > "$ROOT/test.log"
+head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-10 18-02.mp4"
+t0=$(date +%s)
+PATH="$ROOT/bin:$PATH" bash "$ROOT/app/upload-lives.sh" & up=$!
+for i in $(seq 1 60); do grep -q "Uploading 1 file(s)" "$ROOT/test.log" && break; sleep 1; done
+started=$(( $(date +%s) - t0 )); wait "$up"
+check "the morning: the first upload starts within seconds of waking, after the hourly checks ($started s)" \
+      '[ "$started" -le 20 ] && grep -q "Uploaded to" "$ROOT/test.log" && [ "$(cat "$ROOT/app/VERSION")" = vAM ]'
+check "the morning: it keeps the Mac awake while it uploads (caffeinate)" 'grep -qE "^-ims -w [0-9]+$" "$ROOT/caffeinated"'
 setup "$DRIVE"
 
 if [ -f manifest.txt ]; then
