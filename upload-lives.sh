@@ -33,6 +33,9 @@
 # - Brandon's PC copies each live into his own Google Drive, then renames the original here "Copied - ...".
 #   Every 10 minutes this deletes those for good (only files it uploaded itself), so this Drive never fills.
 #   If it is full anyway, the lives wait on this Mac and the status page says so.
+# - A short recording (under MIN_LIVE_MB, or under MIN_LIVE_SECONDS from start to stop) is a test, not a
+#   live: it goes to "Uploader checks/Short recordings" in Drive, where Brandon's PC never makes clips of it.
+# - A new version can take over mid-upload: the upload stops and starts again with it a minute later.
 # None of this needs any app open: launchd runs it every minute while the Mac is on and signed in.
 # Written for macOS's own bash 3.2; runs on Linux too, which is how it is tested (self-test.command).
 set -u
@@ -52,6 +55,8 @@ RCLONE=""
 ONLY_NEW_SINCE=""     # set when the recording folder also holds other videos: older ones are left alone
 UPDATE_URL="https://raw.githubusercontent.com/BrandonLeeRutlidge/salsabeel-uploader/main"
 UPDATE_EVERY=3600
+MIN_LIVE_MB="${SALSABEEL_UPLOADER_MIN_LIVE_MB:-100}"   # smaller than this, or shorter than MIN_LIVE_SECONDS,
+MIN_LIVE_SECONDS=600                                   # is a test recording, not a live
 STATUS_EVERY=1800
 CHECKS_FOLDER="Uploader checks"
 TEMPLATE="${SALSABEEL_UPLOADER_TEMPLATE:-$APP_DIR/status-page.html}"
@@ -77,12 +82,14 @@ if [ -f "$APP_DIR/config.sh" ]; then . "$APP_DIR/config.sh"; fi
 
 if [ "$(uname)" = "Darwin" ]; then
     mtime() { stat -f %m "$1"; }
+    fsize() { stat -f %z "$1"; }
     btime() { stat -f %B "$1"; }
     stamp() { date -r "$1" '+%Y-%m-%d %H-%M'; }
     boot_id() { sysctl -n kern.boottime 2>/dev/null | sed -E 's/^\{ sec = ([0-9]+).*/\1/'; }
     OPEN_PAGE="${SALSABEEL_UPLOADER_OPEN:-open}"
 else
     mtime() { stat -c %Y "$1"; }
+    fsize() { stat -c %s "$1"; }
     btime() { local b; b=$(stat -c %W "$1"); if [ "${b:-0}" -le 0 ]; then b=$(stat -c %Y "$1"); fi; echo "$b"; }
     stamp() { date -d "@$1" '+%Y-%m-%d %H-%M'; }
     boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo none; }
@@ -200,6 +207,7 @@ update_if_due() {
         done
         echo "$version" > "$APP_DIR/VERSION"
         log "Updated itself from version ${current:-unknown} to $version."
+        UPDATED=1
         STATUS_NOW=1
     else
         warn_once "An update to version $version did not download or check out, so it was not used. Still on ${current:-unknown}."
@@ -381,20 +389,34 @@ now=$(date +%s)
 shopt -s nullglob
 finished=0
 
+is_short() {   # a test recording: small, or only a few minutes from start (created) to stop (last written)
+    local f="$1" length
+    if [ $(( $(fsize "$f") / 1048576 )) -lt "$MIN_LIVE_MB" ]; then return 0; fi
+    length=$(( $(mtime "$f") - $(btime "$f") ))
+    [ "$length" -gt 0 ] && [ "$length" -lt "$MIN_LIVE_SECONDS" ]
+}
 take_if_finished() {   # path [since]: a stopped recording goes into "Ready to upload" with a date-and-time name
-    local f="$1" ext name target n
+    local f="$1" ext name target n dir="$READY" short=""
     [ -f "$f" ] && [ -s "$f" ] || return 1
     [ $(( now - $(mtime "$f") )) -ge $(( QUIET_MINUTES * 60 )) ] || return 1
     if [ "${2:-}" = since ] && [ -n "$ONLY_NEW_SINCE" ] && [ "$(mtime "$f")" -lt "$ONLY_NEW_SINCE" ]; then return 1; fi
     if lsof -- "$f" >/dev/null 2>&1; then return 1; fi   # LIVE Studio still has it open
     ext=$(printf '%s' "${f##*.}" | tr 'A-Z' 'a-z')
     name="$PREFIX $(stamp "$(btime "$f")")"
-    target="$READY/$name.$ext"
+    if is_short "$f"; then   # uploaded beside the status note, never with the lives
+        short=1; dir="$READY/$CHECKS_FOLDER/Short recordings"; name="Short recording $(stamp "$(btime "$f")")"
+        mkdir -p "$dir"
+    fi
+    target="$dir/$name.$ext"
     n=2
-    while [ -e "$target" ]; do target="$READY/$name ($n).$ext"; n=$((n + 1)); done
+    while [ -e "$target" ]; do target="$dir/$name ($n).$ext"; n=$((n + 1)); done
     if mv -n "$f" "$target" 2>/dev/null && [ -e "$target" ] && [ ! -e "$f" ]; then
-        log "Recording finished: \"${f#"$WATCH_DIR"/}\" is now \"$(basename "$target")\""
-        finished=$((finished + 1))
+        if [ -n "$short" ]; then
+            log "Short recording (a test?): \"${f#"$WATCH_DIR"/}\" goes to \"$CHECKS_FOLDER/Short recordings\", not with the lives."
+        else
+            log "Recording finished: \"${f#"$WATCH_DIR"/}\" is now \"$(basename "$target")\""
+            finished=$((finished + 1))
+        fi
         return 0
     fi
     warn_once "Could not move \"$f\" (macOS may be blocking access to that folder)."
@@ -478,17 +500,19 @@ fi
 rescue_moved
 clear_copied
 
-set -- "$READY"/*
-if [ $# -eq 0 ]; then status_if_due; exit 0; fi
+pending() { find "$READY" -type f ! -name '.*' 2>/dev/null; }
+label() { pending | while IFS= read -r f; do basename "$f"; done | paste -sd ',' - | sed 's/,/, /g'; }
+waiting=$(pending | grep -c . || true)
+if [ "$waiting" -eq 0 ]; then status_if_due; exit 0; fi
 if recording_now; then   # a live is on: leave the internet to the stream
     if [ ! -f "$APP_DIR/paused" ]; then
-        log "A live is recording: $# upload(s) wait until it stops, so the stream keeps all the internet."
+        log "A live is recording: $waiting upload(s) wait until it stops, so the stream keeps all the internet."
         touch "$APP_DIR/paused"; STATUS_NOW=1
     fi
     status_if_due; exit 0
 fi
 if [ -f "$APP_DIR/paused" ]; then rm -f "$APP_DIR/paused"; log "The recording has stopped: uploads carry on."; fi
-FILES_LABEL=$(for f in "$READY"/*; do basename "$f"; done | paste -sd ',' - | sed 's/,/, /g')
+FILES_LABEL=$(label)
 
 # Show the page when a live has just finished, and once after each restart while uploads are waiting.
 if [ "$finished" -gt 0 ] || [ "$(cat "$APP_DIR/page-opened-boot" 2>/dev/null)" != "$(boot_id)" ]; then
@@ -502,6 +526,7 @@ existing=$("$RCLONE" lsf "$DEST" --files-only 2>/dev/null) ||
     { log "Google Drive is not reachable; trying again in a minute."; status_retry 0; exit 0; }
 taken() { printf '%s\n' "$existing" | grep -Fxq -- "$1"; }
 for f in "$READY"/*; do
+    [ -f "$f" ] || continue
     base=$(basename "$f")
     if taken "$base"; then
         stem="${base%.*}"; ext="${base##*.}"; n=2
@@ -511,11 +536,11 @@ for f in "$READY"/*; do
     existing="$existing
 $base"
 done
-set -- "$READY"/*
-FILES_LABEL=$(for f in "$READY"/*; do basename "$f"; done | paste -sd ',' - | sed 's/,/, /g')
+waiting=$(pending | grep -c . || true)
+FILES_LABEL=$(label)
 
 total=$(du -sk "$READY" | cut -f1)
-log "Uploading $# file(s), $(( total / 1024 )) MB, to $DEST"
+log "Uploading $waiting file(s), $(( total / 1024 )) MB, to $DEST"
 PROGRESS="$APP_DIR/upload-progress.log"
 : > "$PROGRESS"
 args=(move "$READY" "$DEST" --exclude ".*" --retries 3 --low-level-retries 20
@@ -528,8 +553,14 @@ if command -v caffeinate >/dev/null 2>&1; then caffeinate -ims -w "$rclone_pid" 
 pct=0
 ticks=0
 paused=""
+restart=""
 while kill -0 "$rclone_pid" 2>/dev/null; do
     ticks=$((ticks + 1))
+    if [ $((ticks % 15)) -eq 0 ]; then   # a new version takes over now, not after a long upload
+        UPDATED=""
+        update_if_due
+        if [ -n "$UPDATED" ]; then kill "$rclone_pid" 2>/dev/null; wait "$rclone_pid" 2>/dev/null; restart=1; break; fi
+    fi
     if [ $((ticks % 8)) -eq 0 ] && recording_now; then   # a live has started: stop, carry on after it
         kill "$rclone_pid" 2>/dev/null; wait "$rclone_pid" 2>/dev/null
         paused=1
@@ -544,7 +575,10 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
     fi
     sleep 2
 done
-if [ -n "$paused" ]; then
+if [ -n "$restart" ]; then
+    log "Updated mid-upload: the upload starts again with the new version in a minute."
+    status_preparing
+elif [ -n "$paused" ]; then
     log "A live started, so the upload stopped. It carries on by itself once the recording stops."
     touch "$APP_DIR/paused"
     status_paused
