@@ -1,0 +1,566 @@
+#!/bin/bash
+# salsabeel-uploader
+# Salsabeel live uploader: one pass. launchd runs it every minute ("Fix Salsabeel uploader" sets that up).
+#
+# 1. In the recording folder TikTok LIVE Studio saves to (and folders inside it), a video counts as
+#    finished when it has not changed for a few minutes and no program has it open any more.
+# 2. A finished recording is renamed after the time it started, e.g. "Salsabeel live 2026-11-06 18-02.mp4",
+#    and moved into the "Ready to upload" folder beside it.
+# 3. rclone moves everything in "Ready to upload" to Google Drive. rclone deletes each file here only
+#    once Google Drive has the whole of it. A failed upload stays in "Ready to upload" and is tried
+#    again a minute later.
+#
+# Recordings still in progress are never touched, so nothing uploads during the live.
+# While it uploads, a status page (Salsabeel branded) shows in the browser: leave the Mac on, a progress
+# bar and the time left. It opens when a live has finished, and again after a restart mid-upload. The Mac
+# is kept awake until the upload ends. `upload-lives.sh --preview` shows what the page looks like.
+#
+# Looking after itself, so nobody has to go to the Mac:
+# - If the recording folder has gone (moved or deleted), it is made again, so LIVE Studio can save there.
+# - Once an hour it checks UPDATE_URL for a newer version of this script and the status page, and
+#   switches to it. Each file must match the SHA-256 in the manifest, and the script must pass `bash -n`.
+# - Every 30 minutes, and after each upload, it writes "Mac status.txt" (and the end of its log) to the
+#   "Uploader checks" folder inside the Google Drive folder, so Brandon can see from home that it is working.
+#   `upload-lives.sh --status-now` sends it straight away.
+# - Anything of its own that goes missing (its folder, its settings, rclone, the Google sign-in, the background
+#   job's file) is put back from a hidden backup copy, ~/.salsabeel-uploader, which it keeps up to date.
+#   The background job starts with a few lines that put its folder back before running this script.
+# - If LIVE Studio records somewhere else (its save folder was changed or moved), it sees which video file
+#   LIVE Studio has open, and uploads that recording too once it stops.
+# - Once an hour it looks for a moved "Salsabeel lives" folder (home folder, Movies) and uploads what is left in it.
+# - While a live is on (LIVE Studio recording), it uploads nothing, so the stream keeps all the internet. An
+#   upload already running stops when a live starts, and carries on by itself once the recording stops.
+# - Brandon's PC copies each live into his own Google Drive, then renames the original here "Copied - ...".
+#   Every 10 minutes this deletes those for good (only files it uploaded itself), so this Drive never fills.
+#   If it is full anyway, the lives wait on this Mac and the status page says so.
+# None of this needs any app open: launchd runs it every minute while the Mac is on and signed in.
+# Written for macOS's own bash 3.2; runs on Linux too, which is how it is tested (self-test.command).
+set -u
+
+APP_DIR="${SALSABEEL_UPLOADER_DIR:-$HOME/Library/Application Support/SalsabeelLiveUploader}"
+LOG="${SALSABEEL_UPLOADER_LOG:-$HOME/Library/Logs/SalsabeelLiveUploader.log}"
+BACKUP="${SALSABEEL_UPLOADER_BACKUP:-$HOME/.salsabeel-uploader}"
+LABEL="com.salsabeel.live-uploader"
+PLIST="${SALSABEEL_UPLOADER_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
+RECORDER="${SALSABEEL_UPLOADER_RECORDER:-live ?studio}"   # LIVE Studio's programs, by their command line (not the TikTok app)
+PREFIX="Salsabeel live"
+QUIET_MINUTES=2
+BWLIMIT=""
+WATCH_DIR="$HOME/Salsabeel lives/Recordings"   # the usual set-up; config.sh says otherwise if not
+DEST="salsabeel-drive:Salsabeel lives"
+RCLONE=""
+ONLY_NEW_SINCE=""     # set when the recording folder also holds other videos: older ones are left alone
+UPDATE_URL="https://raw.githubusercontent.com/BrandonLeeRutlidge/salsabeel-uploader/main"
+UPDATE_EVERY=3600
+STATUS_EVERY=1800
+CHECKS_FOLDER="Uploader checks"
+TEMPLATE="${SALSABEEL_UPLOADER_TEMPLATE:-$APP_DIR/status-page.html}"
+PAGE="$APP_DIR/Salsabeel live uploader.html"
+export LC_NUMERIC=C
+shopt -u patsub_replacement 2>/dev/null || true
+# config.sh sets WATCH_DIR, DEST (an rclone destination, e.g. "salsabeel-drive:Salsabeel lives") and RCLONE,
+# and may set ONLY_NEW_SINCE and UPDATE_URL ("" turns updates off).
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+mkdir -p "$(dirname "$LOG")" "$APP_DIR"
+log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+touch "$APP_DIR/last-run"     # "Fix Salsabeel uploader" reads this to see that the Mac really runs it
+
+# Put back anything of its own that has gone missing (moved or deleted), from the backup copy.
+RESTORED=""
+for f in config.sh status-page.html VERSION self-test.command show-log.command uninstall.command; do
+    if [ ! -f "$APP_DIR/$f" ] && [ -f "$BACKUP/$f" ] && cp -p "$BACKUP/$f" "$APP_DIR/$f"; then RESTORED="$RESTORED $f"; fi
+done
+if [ ! -x "$APP_DIR/bin/rclone" ] && [ -x "$BACKUP/bin/rclone" ] && mkdir -p "$APP_DIR/bin" &&
+   cp -p "$BACKUP/bin/rclone" "$APP_DIR/bin/rclone"; then RESTORED="$RESTORED bin/rclone"; fi
+if [ -n "$RESTORED" ]; then log "Put back from the backup copy (moved or deleted?):$RESTORED"; fi
+if [ -f "$APP_DIR/config.sh" ]; then . "$APP_DIR/config.sh"; fi
+
+if [ "$(uname)" = "Darwin" ]; then
+    mtime() { stat -f %m "$1"; }
+    btime() { stat -f %B "$1"; }
+    stamp() { date -r "$1" '+%Y-%m-%d %H-%M'; }
+    boot_id() { sysctl -n kern.boottime 2>/dev/null | sed -E 's/^\{ sec = ([0-9]+).*/\1/'; }
+    OPEN_PAGE="${SALSABEEL_UPLOADER_OPEN:-open}"
+else
+    mtime() { stat -c %Y "$1"; }
+    btime() { local b; b=$(stat -c %W "$1"); if [ "${b:-0}" -le 0 ]; then b=$(stat -c %Y "$1"); fi; echo "$b"; }
+    stamp() { date -d "@$1" '+%Y-%m-%d %H-%M'; }
+    boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo none; }
+    OPEN_PAGE="${SALSABEEL_UPLOADER_OPEN:-:}"
+fi
+is_video() { case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in *.mp4|*.mov|*.mkv|*.flv) return 0 ;; esac; return 1; }
+sha256() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi | cut -d' ' -f1; }
+
+# --- The status page -------------------------------------------------------------------------
+LEAVE_ON="Please leave the Mac on, with the lid open, until this says done. You can carry on using it."
+FILES_LABEL=""
+write_status() {   # state badge heading message percent detail title
+    [ -f "$TEMPLATE" ] || return 0
+    local page refresh='<meta http-equiv="refresh" content="3">'
+    if [ "$1" = "done" ]; then refresh=""; fi
+    page=$(cat "$TEMPLATE")
+    page=${page//__REFRESH__/$refresh}
+    page=${page//__STATE__/$1}
+    page=${page//__BADGE__/$2}
+    page=${page//__HEADING__/$3}
+    page=${page//__MESSAGE__/$4}
+    page=${page//__PERCENT__/$5}
+    page=${page//__DETAIL__/$6}
+    page=${page//__TITLE__/$7}
+    page=${page//__FILE__/$FILES_LABEL}
+    printf '%s\n' "$page" > "$PAGE.tmp" && mv -f "$PAGE.tmp" "$PAGE"
+}
+open_page() { "$OPEN_PAGE" "$PAGE" >/dev/null 2>&1 || true; boot_id > "$APP_DIR/page-opened-boot"; }
+human_size() {   # "8.027 MiB" -> "8 MB", "1.234 GiB" -> "1.2 GB"
+    case "${1#* }" in
+        TiB|TB) printf '%.1f TB' "${1% *}" ;; GiB|GB) printf '%.1f GB' "${1% *}" ;;
+        MiB|MB) printf '%.0f MB' "${1% *}" ;; KiB|kB|KB) printf '%.0f KB' "${1% *}" ;; *) printf '%s' "$1" ;;
+    esac
+}
+time_left() {   # rclone's "1h2m3s" -> "about 1 hour 2 minutes left"
+    local h=0 m=0
+    case "$1" in ""|"-") echo "working out the time left"; return ;; esac
+    if [[ $1 =~ ([0-9]+)h ]]; then h=${BASH_REMATCH[1]}; fi
+    if [[ $1 =~ ([0-9]+)m ]]; then m=${BASH_REMATCH[1]}; fi
+    if [ "$h" -gt 0 ]; then
+        printf 'about %s hour%s %s minute%s left' "$h" "$([ "$h" = 1 ] || echo s)" "$m" "$([ "$m" = 1 ] || echo s)"
+    elif [ "$m" -gt 0 ]; then
+        printf 'about %s minute%s left' "$m" "$([ "$m" = 1 ] || echo s)"
+    else
+        printf 'less than a minute left'
+    fi
+}
+status_preparing() { write_status preparing "Live finished" "Getting today&#39;s live ready to upload" "$LEAVE_ON" 0 "Starting the upload" "Starting upload · Salsabeel"; }
+status_uploading() {   # percent "done / total" eta
+    local detail="$(human_size "${2% / *}") of $(human_size "${2#* / }") · $(time_left "$3")"
+    write_status uploading "Uploading" "Uploading today&#39;s live" "$LEAVE_ON" "$1" "$detail" "Uploading $1% · Salsabeel"
+}
+status_done() { write_status done "Done" "The live is in Google Drive" "All done. You can turn the Mac off now." 100 "Uploaded at $(date '+%H:%M')" "Done · Salsabeel"; }
+status_paused() { write_status retry "Paused for the live" "Upload paused while you are live" "A live is on, so the upload waits and carries on by itself once the recording stops. Leave the Mac on." "${pct:-0}" "Carries on after the live" "Paused · Salsabeel"; }
+status_full() { write_status retry "Google Drive is full" "Waiting for space in Google Drive" "The Google Drive is full right now. The live is safe on this Mac and uploads by itself once there is space. You can turn the Mac off." "${pct:-0}" "Tries again every minute" "Drive full · Salsabeel"; }
+status_retry() { write_status retry "Not uploaded yet" "Waiting for the internet" "Google Drive could not be reached. It tries again by itself every minute, so leave the Mac on and online." "${1:-0}" "Next try in about a minute" "Waiting · Salsabeel"; }
+
+if [ "${1:-}" = "--preview" ]; then   # what the page looks like mid-upload
+    TEMPLATE="${SALSABEEL_UPLOADER_TEMPLATE:-$(dirname "$0")/status-page.html}"
+    PAGE="${TMPDIR:-/tmp}/Salsabeel live uploader (preview).html"
+    FILES_LABEL="Salsabeel live 2026-11-06 18-02.mp4"
+    status_uploading 42 "2.384 GiB / 5.678 GiB" "6m12s"
+    "$OPEN_PAGE" "$PAGE" >/dev/null 2>&1 || true
+    echo "$PAGE"
+    exit 0
+fi
+
+notify() {
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e "display notification \"$1\" with title \"Salsabeel live uploader\"" >/dev/null 2>&1 || true
+    fi
+}
+
+# Warn once, not every minute, while something is missing.
+warn_once() {
+    if [ "$(cat "$APP_DIR/warned" 2>/dev/null)" != "$1" ]; then log "$1"; echo "$1" > "$APP_DIR/warned"; fi
+}
+
+# --- Videos in the recording folder --------------------------------------------------------------
+READY="$WATCH_DIR/Ready to upload"
+recordings() {   # every video in the recording folder and up to 2 folders down, but not "Ready to upload"
+    find "$WATCH_DIR" -maxdepth 3 \( -path "$READY" -o -name '.*' \) -prune -o -type f \
+         \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.mkv' -o -iname '*.flv' \) -print 2>/dev/null
+}
+count_videos() { find "$1" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' '; }
+
+# --- Updates from Brandon ----------------------------------------------------------------------
+update_if_due() {
+    [ -n "$UPDATE_URL" ] && command -v curl >/dev/null 2>&1 || return 0
+    local checked="$APP_DIR/update-checked" now_s tmp version current sum name ok=1 names=""
+    now_s=$(date +%s)
+    if [ -f "$checked" ] && [ $(( now_s - $(mtime "$checked") )) -lt "$UPDATE_EVERY" ]; then return 0; fi
+    touch "$checked"
+    tmp=$(mktemp -d "$APP_DIR/.update.XXXXXX") || return 0
+    if ! curl -fsSL --max-time 30 -o "$tmp/manifest.txt" "$UPDATE_URL/manifest.txt" 2>/dev/null; then
+        rm -rf "$tmp"; return 0
+    fi
+    version=$(sed -n 's/^version //p' "$tmp/manifest.txt" | head -n 1)
+    current=$(cat "$APP_DIR/VERSION" 2>/dev/null)
+    if [ -z "$version" ] || [ "$version" = "$current" ]; then rm -rf "$tmp"; return 0; fi
+    while read -r sum name; do
+        case "$name" in upload-lives.sh|status-page.html) ;; *) continue ;; esac   # nothing else is replaced
+        if curl -fsSL --max-time 300 -o "$tmp/$name" "$UPDATE_URL/$name" 2>/dev/null &&
+           [ "$(sha256 "$tmp/$name")" = "$sum" ]; then
+            names="$names $name"
+        else
+            ok=0
+        fi
+    done < "$tmp/manifest.txt"
+    if [ "$ok" = 1 ] && [ -f "$tmp/upload-lives.sh" ] && bash -n "$tmp/upload-lives.sh" 2>/dev/null &&
+       grep -qx '# salsabeel-uploader' "$tmp/upload-lives.sh"; then
+        for name in $names; do
+            chmod 755 "$tmp/$name"
+            mv -f "$tmp/$name" "$APP_DIR/$name"   # a new file: this run carries on with the old one
+        done
+        echo "$version" > "$APP_DIR/VERSION"
+        log "Updated itself from version ${current:-unknown} to $version."
+        STATUS_NOW=1
+    else
+        warn_once "An update to version $version did not download or check out, so it was not used. Still on ${current:-unknown}."
+    fi
+    rm -rf "$tmp"
+}
+
+# --- The status note in Google Drive -----------------------------------------------------------------
+STATUS_NOW=0
+send_status() {
+    local note="$APP_DIR/Mac status.txt" drive mac waiting=0 ready=0 f
+    mac=$(scutil --get ComputerName 2>/dev/null || hostname)
+    if [ -d "$WATCH_DIR" ]; then waiting=$(recordings | wc -l | tr -d ' '); fi
+    if [ -d "$READY" ]; then ready=$(count_videos "$READY"); fi
+    drive=$("$RCLONE" about "${DEST%%:*}:" --contimeout 15s --timeout 30s 2>/dev/null | sed 's/^/  /')
+    IN_DRIVE=$("$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 30s 2>/dev/null | grep -v '^Copied - ' |
+               while IFS= read -r f; do is_video "$f" && echo "$f"; done | grep -c . || true)
+    {
+        echo "Salsabeel live uploader: status from the streaming Mac"
+        echo
+        echo "Sent:               $(date '+%Y-%m-%d %H:%M') (every 30 minutes while the Mac is on and online)"
+        echo "Mac:                $mac"
+        echo "Version:            $(cat "$APP_DIR/VERSION" 2>/dev/null || echo unknown)"
+        echo "Recording folder:   $WATCH_DIR"
+        echo "  videos in it:     $waiting (recording, or stopped less than ${QUIET_MINUTES} minutes ago)"
+        echo "Waiting to upload:  $ready"
+        if [ -n "${IN_DRIVE+x}" ]; then echo "In Google Drive, not yet copied by Brandon's PC: $IN_DRIVE"; fi
+        if [ -d "$READY" ]; then for f in "$READY"/*; do [ -f "$f" ] && echo "  $(basename "$f")"; done; fi
+        if [ -s "$FOLLOW" ]; then
+            echo "LIVE Studio recording outside the folder (uploads when it stops):"
+            sed 's/^/  /' "$FOLLOW"
+        fi
+        echo "Backup copy:        $( [ -f "$BACKUP/upload-lives.sh" ] && echo "yes, in $BACKUP" || echo "not yet")"
+        echo "Free on the Mac:    $(df -h "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+        echo "Google Drive space:"
+        echo "${drive:-  (not available)}"
+        echo
+        echo "The end of the log:"
+        tail -n 40 "$LOG" 2>/dev/null | sed 's/^/  /'
+    } > "$note"
+    if "$RCLONE" copyto "$note" "$DEST/$CHECKS_FOLDER/Mac status.txt" --contimeout 15s --timeout 60s \
+           --retries 1 --low-level-retries 2 >/dev/null 2>&1; then
+        touch "$APP_DIR/status-sent"
+        return 0
+    fi
+    return 1
+}
+status_if_due() {
+    local sent="$APP_DIR/status-sent"
+    if [ "$STATUS_NOW" = 1 ] || [ ! -f "$sent" ] || [ $(( $(date +%s) - $(mtime "$sent") )) -ge "$STATUS_EVERY" ]; then
+        send_status || true
+    fi
+}
+
+# --- Looking after itself ------------------------------------------------------------------------
+FOLLOW="$APP_DIR/following"
+if [ -n "$RESTORED" ]; then STATUS_NOW=1; fi
+find_rclone() {
+    local p
+    for p in "$(command -v "${RCLONE:-rclone}" 2>/dev/null)" "$APP_DIR/bin/rclone" "$BACKUP/bin/rclone" \
+             "$(command -v rclone 2>/dev/null)" /opt/homebrew/bin/rclone /usr/local/bin/rclone; do
+        if [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ]; then echo "$p"; return 0; fi
+    done
+    return 1
+}
+if ! found=$(find_rclone); then warn_once "rclone is missing: run \"Fix Salsabeel uploader\"."; exit 0; fi
+if [ -n "$RCLONE" ] && [ "$found" != "$RCLONE" ] && [ ! -x "$RCLONE" ]; then
+    log "rclone had gone from \"$RCLONE\"; using \"$found\"."
+fi
+RCLONE="$found"
+REMOTE="${DEST%%:*}"
+is_remote() { case "$REMOTE" in "$DEST"|*/*|"") return 1 ;; esac; return 0; }   # not a plain folder (tests)
+rclone_conf() { "$RCLONE" config file 2>/dev/null | tail -n 1; }
+remote_section() { awk -v h="[$REMOTE]" '/^\[/ { p = ($0 == h) } p' "$1" 2>/dev/null; }
+
+xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+write_plist() {   # the background job. Its first lines put this folder back from the backup (or online) if it has gone.
+    local boot
+    boot=$(cat <<'BOOT'
+if [ ! -f "$A/upload-lives.sh" ]; then
+  mkdir -p "$A"
+  if [ -f "$B/upload-lives.sh" ]; then cp -Rp "$B/." "$A/"
+  elif [ -n "$U" ] && curl -fsSL -m 120 -o "$A/new.sh" "$U/upload-lives.sh" && bash -n "$A/new.sh" &&
+       grep -qx '# salsabeel-uploader' "$A/new.sh"; then mv -f "$A/new.sh" "$A/upload-lives.sh"
+  fi
+fi
+exec /bin/bash "$A/upload-lives.sh"
+BOOT
+)
+    boot="A=$(printf %q "$APP_DIR"); B=$(printf %q "$BACKUP"); U=$(printf %q "$UPDATE_URL")
+$boot"
+    mkdir -p "$(dirname "$PLIST")" || return 1
+    cat > "$PLIST.tmp" <<EOF || return 1
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>$(xml "$boot")</string>
+    </array>
+    <key>StartInterval</key><integer>60</integer>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>$(xml "$(dirname "$LOG")/SalsabeelLiveUploader.out.log")</string>
+    <key>StandardErrorPath</key><string>$(xml "$(dirname "$LOG")/SalsabeelLiveUploader.out.log")</string>
+</dict>
+</plist>
+EOF
+    mv -f "$PLIST.tmp" "$PLIST"
+}
+backup_self() {   # keep the hidden copy up to date (only what changed is copied)
+    local f conf
+    mkdir -p "$BACKUP/bin" 2>/dev/null || return 0
+    chmod 700 "$BACKUP" 2>/dev/null
+    for f in upload-lives.sh status-page.html config.sh VERSION self-test.command show-log.command uninstall.command; do
+        if [ -f "$APP_DIR/$f" ] && ! cmp -s "$APP_DIR/$f" "$BACKUP/$f"; then cp -p "$APP_DIR/$f" "$BACKUP/$f"; fi
+    done
+    if [ -x "$APP_DIR/bin/rclone" ] && { [ ! -x "$BACKUP/bin/rclone" ] || [ "$APP_DIR/bin/rclone" -nt "$BACKUP/bin/rclone" ]; }; then
+        cp -p "$APP_DIR/bin/rclone" "$BACKUP/bin/rclone"
+    fi
+    if is_remote; then
+        conf=$(rclone_conf)
+        if [ -f "$conf" ]; then
+            ( umask 077; remote_section "$conf" > "$BACKUP/rclone.conf.new" )
+            if [ -s "$BACKUP/rclone.conf.new" ] && ! cmp -s "$BACKUP/rclone.conf.new" "$BACKUP/rclone.conf"; then
+                mv -f "$BACKUP/rclone.conf.new" "$BACKUP/rclone.conf"
+            else
+                rm -f "$BACKUP/rclone.conf.new"
+            fi
+        fi
+    fi
+    if [ ! -f "$PLIST" ]; then
+        write_plist && log "The background job's file had gone, so it was written again."
+    elif ! grep -q '<string>-c</string>' "$PLIST" 2>/dev/null; then
+        write_plist && log "The background job's file now puts this folder back if it goes (from the next sign-in)."
+    fi
+    return 0
+}
+if [ "${1:-}" = "--install" ]; then write_plist && backup_self; exit $?; fi
+if is_remote && ! "$RCLONE" listremotes 2>/dev/null | grep -qxF "$REMOTE:"; then
+    if [ -s "$BACKUP/rclone.conf" ]; then
+        conf=$(rclone_conf)
+        mkdir -p "$(dirname "$conf")"
+        { if [ -s "$conf" ]; then echo; fi; cat "$BACKUP/rclone.conf"; } >> "$conf"
+        chmod 600 "$conf" 2>/dev/null
+        log "The Google sign-in had gone from rclone's settings, so it was put back from the backup copy."
+        STATUS_NOW=1
+    else
+        warn_once "Not signed in to Google: run \"Fix Salsabeel uploader\"."; exit 0
+    fi
+fi
+if [ ! -d "$WATCH_DIR" ]; then
+    if mkdir -p "$WATCH_DIR" 2>/dev/null; then
+        log "The recording folder \"$WATCH_DIR\" had gone (moved or deleted?), so it was made again."
+        STATUS_NOW=1
+    else
+        warn_once "Waiting: the recording folder \"$WATCH_DIR\" is not there and could not be made."
+        exit 0
+    fi
+fi
+rm -f "$APP_DIR/warned"
+backup_self
+
+if [ "${1:-}" = "--status-now" ]; then send_status; exit $?; fi
+
+# One copy at a time (launchd already avoids overlaps; this covers a manual run as well).
+PIDFILE="$APP_DIR/running.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then exit 0; fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
+
+update_if_due
+
+mkdir -p "$READY"
+now=$(date +%s)
+shopt -s nullglob
+finished=0
+
+take_if_finished() {   # path [since]: a stopped recording goes into "Ready to upload" with a date-and-time name
+    local f="$1" ext name target n
+    [ -f "$f" ] && [ -s "$f" ] || return 1
+    [ $(( now - $(mtime "$f") )) -ge $(( QUIET_MINUTES * 60 )) ] || return 1
+    if [ "${2:-}" = since ] && [ -n "$ONLY_NEW_SINCE" ] && [ "$(mtime "$f")" -lt "$ONLY_NEW_SINCE" ]; then return 1; fi
+    if lsof -- "$f" >/dev/null 2>&1; then return 1; fi   # LIVE Studio still has it open
+    ext=$(printf '%s' "${f##*.}" | tr 'A-Z' 'a-z')
+    name="$PREFIX $(stamp "$(btime "$f")")"
+    target="$READY/$name.$ext"
+    n=2
+    while [ -e "$target" ]; do target="$READY/$name ($n).$ext"; n=$((n + 1)); done
+    if mv -n "$f" "$target" 2>/dev/null && [ -e "$target" ] && [ ! -e "$f" ]; then
+        log "Recording finished: \"${f#"$WATCH_DIR"/}\" is now \"$(basename "$target")\""
+        finished=$((finished + 1))
+        return 0
+    fi
+    warn_once "Could not move \"$f\" (macOS may be blocking access to that folder)."
+    return 1
+}
+live_studio_videos() {   # the video files LIVE Studio is recording to right now (app caches left out)
+    local pids p
+    pids=$(ps -axo pid=,args= 2>/dev/null | awk -v m="$RECORDER" '{ l = tolower($0) }
+               l ~ m && l !~ /^ *[0-9]+ awk / && l !~ /rclone|upload-lives|fix salsabeel/ { print $1 }' | paste -sd, -)
+    [ -n "$pids" ] || return 0
+    lsof -nP -p "$pids" -Fn 2>/dev/null | sed -n 's/^n//p' | sort -u | while IFS= read -r p; do
+        is_video "$p" && [ -f "$p" ] || continue
+        case "$p" in */Library/*|/System/*) continue ;; esac
+        if [ -z "${SALSABEEL_UPLOADER_TEST:-}" ]; then   # macOS's temporary folders (the self-test works in one)
+            case "$p" in /private/var/folders/*|/var/folders/*) continue ;; esac
+        fi
+        echo "$p"
+    done
+}
+recording_now() {   # is a live on? LIVE Studio has a recording open, or a recording changed in the last 90 seconds
+    local f t
+    if [ -n "$(live_studio_videos)" ]; then return 0; fi
+    t=$(date +%s)
+    while IFS= read -r f; do
+        if [ -f "$f" ] && [ $(( t - $(mtime "$f") )) -lt 90 ]; then return 0; fi
+    done < <(recordings; if [ -s "$FOLLOW" ]; then cat "$FOLLOW"; fi)
+    return 1
+}
+follow_live_studio() {   # video files LIVE Studio has open outside the recording folder
+    local p
+    live_studio_videos | while IFS= read -r p; do
+        case "$p" in "$WATCH_DIR"/*) continue ;; esac
+        if ! grep -qxF -- "$p" "$FOLLOW" 2>/dev/null; then
+            echo "$p" >> "$FOLLOW"
+            log "LIVE Studio is recording to \"$p\", outside the recording folder: it uploads when the recording stops."
+        fi
+    done
+}
+rescue_moved() {   # once an hour: recordings left in a moved "Salsabeel lives" folder (never in Desktop,
+    local f        # Documents or Downloads, so macOS never asks about them in the background)
+    if [ -f "$APP_DIR/moved-checked" ] && [ $(( now - $(mtime "$APP_DIR/moved-checked") )) -lt 3600 ]; then return 0; fi
+    touch "$APP_DIR/moved-checked"
+    find "$HOME" -maxdepth 3 \( -path "$HOME/Library" -o -path "$HOME/Desktop" -o -path "$HOME/Documents" \
+         -o -path "$HOME/Downloads" -o -path "$HOME/Pictures" -o -path "$HOME/Music" -o -name '.*' \) -prune \
+         -o -type d -name 'Salsabeel lives' -print 2>/dev/null | while IFS= read -r d; do
+        [ -d "$d/Recordings" ] || continue
+        case "$WATCH_DIR" in "$d/Recordings"|"$d/Recordings"/*) continue ;; esac
+        find "$d/Recordings" -maxdepth 3 -type f ! -name '.*' 2>/dev/null
+    done > "$APP_DIR/moved-videos"
+    while IFS= read -r f; do
+        if is_video "$f" && take_if_finished "$f"; then log "  (that one was in a moved \"Salsabeel lives\" folder)"; fi
+    done < "$APP_DIR/moved-videos"
+}
+
+clear_copied() {   # lives Brandon's PC has copied to its own Drive ("Copied - ..."): delete them here for good
+    local f n=0
+    if [ -f "$APP_DIR/cleared-checked" ] && [ $(( now - $(mtime "$APP_DIR/cleared-checked") )) -lt 600 ]; then return 0; fi
+    touch "$APP_DIR/cleared-checked"
+    "$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 60s 2>/dev/null | grep '^Copied - ' > "$APP_DIR/copied" || return 0
+    while IFS= read -r f; do
+        is_video "$f" || continue
+        if "$RCLONE" deletefile "$DEST/$f" --drive-use-trash=false --contimeout 15s --timeout 60s >/dev/null 2>&1; then
+            log "Deleted \"$f\" from this Google Drive: Brandon's PC has its own copy."
+            n=$((n + 1))
+        fi
+    done < "$APP_DIR/copied"
+    if [ "$n" -gt 0 ]; then STATUS_NOW=1; fi
+    return 0
+}
+
+follow_live_studio
+while IFS= read -r f; do take_if_finished "$f" since; done < <(recordings)
+if [ -s "$FOLLOW" ]; then
+    : > "$FOLLOW.next"
+    while IFS= read -r f; do
+        [ -e "$f" ] || continue                          # gone: LIVE Studio moved it on, or someone did
+        take_if_finished "$f" || echo "$f" >> "$FOLLOW.next"
+    done < "$FOLLOW"
+    mv -f "$FOLLOW.next" "$FOLLOW"
+fi
+rescue_moved
+clear_copied
+
+set -- "$READY"/*
+if [ $# -eq 0 ]; then status_if_due; exit 0; fi
+if recording_now; then   # a live is on: leave the internet to the stream
+    if [ ! -f "$APP_DIR/paused" ]; then
+        log "A live is recording: $# upload(s) wait until it stops, so the stream keeps all the internet."
+        touch "$APP_DIR/paused"; STATUS_NOW=1
+    fi
+    status_if_due; exit 0
+fi
+if [ -f "$APP_DIR/paused" ]; then rm -f "$APP_DIR/paused"; log "The recording has stopped: uploads carry on."; fi
+FILES_LABEL=$(for f in "$READY"/*; do basename "$f"; done | paste -sd ',' - | sed 's/,/, /g')
+
+# Show the page when a live has just finished, and once after each restart while uploads are waiting.
+if [ "$finished" -gt 0 ] || [ "$(cat "$APP_DIR/page-opened-boot" 2>/dev/null)" != "$(boot_id)" ]; then
+    status_preparing
+    open_page
+fi
+
+# Never overwrite a recording already in Google Drive: a clash gets " (2)", " (3)" and so on.
+existing=$("$RCLONE" lsf "$DEST" --files-only 2>/dev/null) ||
+    { "$RCLONE" mkdir "$DEST" >/dev/null 2>&1 && existing=$("$RCLONE" lsf "$DEST" --files-only 2>/dev/null); } ||
+    { log "Google Drive is not reachable; trying again in a minute."; status_retry 0; exit 0; }
+taken() { printf '%s\n' "$existing" | grep -Fxq -- "$1"; }
+for f in "$READY"/*; do
+    base=$(basename "$f")
+    if taken "$base"; then
+        stem="${base%.*}"; ext="${base##*.}"; n=2
+        while taken "$stem ($n).$ext" || [ -e "$READY/$stem ($n).$ext" ]; do n=$((n + 1)); done
+        mv -n "$f" "$READY/$stem ($n).$ext" && base="$stem ($n).$ext"
+    fi
+    existing="$existing
+$base"
+done
+set -- "$READY"/*
+FILES_LABEL=$(for f in "$READY"/*; do basename "$f"; done | paste -sd ',' - | sed 's/,/, /g')
+
+total=$(du -sk "$READY" | cut -f1)
+log "Uploading $# file(s), $(( total / 1024 )) MB, to $DEST"
+PROGRESS="$APP_DIR/upload-progress.log"
+: > "$PROGRESS"
+args=(move "$READY" "$DEST" --exclude ".*" --retries 3 --low-level-retries 20
+      --stats 2s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file "$PROGRESS")
+if [ -n "$BWLIMIT" ]; then args+=(--bwlimit "$BWLIMIT"); fi
+
+"$RCLONE" "${args[@]}" &
+rclone_pid=$!
+if command -v caffeinate >/dev/null 2>&1; then caffeinate -ims -w "$rclone_pid" & fi   # no sleeping mid-upload
+pct=0
+ticks=0
+paused=""
+while kill -0 "$rclone_pid" 2>/dev/null; do
+    ticks=$((ticks + 1))
+    if [ $((ticks % 8)) -eq 0 ] && recording_now; then   # a live has started: stop, carry on after it
+        kill "$rclone_pid" 2>/dev/null; wait "$rclone_pid" 2>/dev/null
+        paused=1
+        break
+    fi
+    line=$(grep -E ' / .*[0-9]+%' "$PROGRESS" 2>/dev/null | tail -n 1)
+    if [ -n "$line" ]; then
+        pct=$(printf '%s' "$line" | grep -oE '[0-9]+%' | tail -n 1 | tr -d '%')
+        sizes=$(printf '%s' "$line" | sed -nE 's#.* ([0-9.]+ [KMGTP]?i?B) / ([0-9.]+ [KMGTP]?i?B),.*#\1 / \2#p')
+        eta=$(printf '%s' "$line" | sed -nE 's/.*ETA ([^ ]+).*/\1/p')
+        if [ -n "$pct" ] && [ -n "$sizes" ]; then status_uploading "$pct" "$sizes" "$eta"; fi
+    fi
+    sleep 2
+done
+if [ -n "$paused" ]; then
+    log "A live started, so the upload stopped. It carries on by itself once the recording stops."
+    touch "$APP_DIR/paused"
+    status_paused
+elif wait "$rclone_pid"; then
+    log "Uploaded to $DEST"
+    status_done
+    notify "The live recording is in Google Drive. You can turn the Mac off."
+else
+    grep -vE ' / .*[0-9]+%' "$PROGRESS" | tail -n 5 >> "$LOG"
+    if grep -qiE 'storageQuotaExceeded|quota has been exceeded|quotaExceeded' "$PROGRESS"; then
+        log "Google Drive is full: it stays in \"Ready to upload\" and is tried again in a minute."
+        status_full
+    else
+        log "Upload failed; it stays in \"Ready to upload\" and is tried again in a minute."
+        status_retry "${pct:-0}"
+    fi
+fi
+STATUS_NOW=1
+status_if_due
