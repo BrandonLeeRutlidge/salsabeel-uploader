@@ -563,18 +563,7 @@ measure_line() {   # sets LAT (middle delay in ms, "" if nothing came back) and 
     if [ "$total" -gt 0 ] && [ "$n" -lt "$total" ]; then LOSS=$(( (total - n) * 100 / total )); fi
     LAT=$(sort -n "$APP_DIR/pings" 2>/dev/null | awk '{ a[NR] = $1 } END { if (NR) printf "%d", a[int((NR + 1) / 2)] + 0.5 }')
 }
-live_name() {   # "Salsabeel live 2026-11-07 18-02.mp4" -> "7 Nov live"
-    local m d
-    case "$1" in "Short recording"*) echo "a short recording"; return ;; esac
-    if [[ $1 =~ ([0-9]{4})-([0-9]{2})-([0-9]{2}) ]]; then
-        m=$(( 10#${BASH_REMATCH[2]} )); d=$(( 10#${BASH_REMATCH[3]} ))
-        if [ "$m" -ge 1 ] && [ "$m" -le 12 ]; then
-            set -- Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec; shift $(( m - 1 ))
-            echo "$d $1 live"; return
-        fi
-    fi
-    echo "the live"
-}
+live_name() { echo "${1%.*}"; }   # "Salsabeel live 2026-11-07 18-02.mp4" -> "Salsabeel live 2026-11-07 18-02"
 current_file() {   # the first file of this upload not yet in Google Drive
     local f
     while IFS= read -r f; do if [ -e "$READY/$f" ]; then basename "$f"; return; fi; done < "$APP_DIR/to-upload"
@@ -839,7 +828,7 @@ elif wait "$rclone_pid"; then
     status_done
     if [ "$mode" = full ]; then notify "The live recording is in Google Drive. You can turn the Mac off."; fi
     NOW_LINE="Nothing to upload"
-    if [ "$mode" = live ] && [ "$left" -gt 0 ]; then NOW_LINE="A live is on: uploading slowly, the next one starts in a minute"
+    if [ "$mode" = live ] && [ "$left" -gt 0 ]; then NOW_LINE="A live is on: $(plural "$left" "upload waits" "uploads wait"), the next goes slowly in a minute"
     elif [ "$left" -gt 0 ]; then now_full "$left"; fi   # only what fitted went up
 else
     grep -vE ' / .*[0-9]+%' "$PROGRESS" | tail -n 5 >> "$LOG"

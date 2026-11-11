@@ -355,16 +355,16 @@ bash "$ROOT/app/upload-lives.sh" & up=$!
 seen_note=""; seen_page=""
 for i in $(seq 1 40); do
     kill -0 "$up" 2>/dev/null || break
-    grep -qE '^Now: +A live is on: uploading slowly \([0-9.]+ Mbit/s\), 7 Nov live [0-9]+%$' "$NOTE" 2>/dev/null && seen_note=1
+    grep -qE '^Now: +A live is on: uploading slowly \([0-9.]+ Mbit/s\), Salsabeel live 2026-11-07 18-02 [0-9]+%$' "$NOTE" 2>/dev/null && seen_note=1
     grep -q "Uploading slowly during the live" "$PAGE" 2>/dev/null && seen_page=1
     sleep 1
 done
 wait "$up"; took=$(( $(date +%s) - t0 ))
 check "a live on: it uploads anyway, slowly (capped, $took seconds for 2.5 MB)" \
-      '[ ! -e "$LIVE7" ] && [ -e "$DRIVE/Salsabeel live 2026-11-07 18-02.mp4" ] && [ "$took" -ge 6 ] && grep -q "uploading 7 Nov live slowly, at 1.5 Mbit/s, then 3.0" "$ROOT/test.log"'
+      '[ ! -e "$LIVE7" ] && [ -e "$DRIVE/Salsabeel live 2026-11-07 18-02.mp4" ] && [ "$took" -ge 6 ] && grep -q "uploading Salsabeel live 2026-11-07 18-02 slowly, at 1.5 Mbit/s, then 3.0" "$ROOT/test.log"'
 check "a live on: it starts at 1.5 Mbit/s, then a tenth of the line once it can slow down again" \
       'grep -q "Upload speed during the live: 3.0 Mbit/s (its starting speed" "$ROOT/test.log"'
-check "a live on: the note says \"A live is on: uploading slowly (… Mbit/s), 7 Nov live …%\", and so does the page" \
+check "a live on: the note says \"A live is on: uploading slowly (… Mbit/s), Salsabeel live 2026-11-07 18-02 …%\", and so does the page" \
       '[ -n "$seen_note" ] && [ -n "$seen_page" ]'
 check "a live on: the live recording itself is never touched, and the page never pops up" \
       '[ -e "$REC/on_air.mp4" ] && [ "$(fsize_of "$REC/on_air.mp4")" = 4096 ] && [ ! -e "$DRIVE/on_air.mp4" ] && [ "$(count "$REC/Ready to upload" "*.mp4")" = 0 ] && [ "$(opened)" = "$opened_before" ]'
