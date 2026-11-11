@@ -41,6 +41,9 @@ agos() {   # the same, in seconds
 fails=0
 check() { if eval "$2"; then echo "  ok    $1"; else echo "  FAIL  $1"; fails=$((fails + 1)); fi; }
 count() { find "$1" -maxdepth 1 -type f -name "$2" | wc -l | tr -d ' '; }
+mtime_of() { if [ "$(uname)" = "Darwin" ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi; }
+NOTE="$DRIVE/Uploader checks/Mac status.txt"
+now_is() { grep -qxF "Now:                $2" "$1"; }   # note "sentence": the note's Now: line, word for word
 
 echo "Salsabeel live uploader: self-test"
 head -c 4096 /dev/zero > "$REC/record_finished.mp4";  ago "$REC/record_finished.mp4" 10
@@ -70,11 +73,14 @@ head -c 4096 /dev/zero > "$REC/again_a.mp4"; ago "$REC/again_a.mp4" 10
 head -c 4096 /dev/zero > "$REC/again_b.mp4"; ago "$REC/again_b.mp4" 10
 printf '[offline]\ntype = http\nurl = http://127.0.0.1:9/\n' > "$ROOT/offline.conf"
 setup "offline:Salsabeel lives"   # signed in, but Google Drive can't be reached
+rm -f "$ROOT/app/status-sent"
 RCLONE_CONFIG="$ROOT/offline.conf" bash ./upload-lives.sh 2>/dev/null
 check "when the upload fails, the recordings wait in \"Ready to upload\"" \
       '[ "$(count "$REC/Ready to upload" "Salsabeel live *.mp4")" = 2 ]'
 check "the page says it is waiting, tells them to leave the Mac on, and keeps refreshing" \
       'grep -q "Waiting for the internet" "$PAGE" && grep -q "leave the Mac on" "$PAGE" && grep -q "http-equiv=\"refresh\"" "$PAGE"'
+check "offline: the note's Now line says \"Waiting for the internet\"" \
+      'now_is "$ROOT/app/Mac status.txt" "Waiting for the internet"'
 setup "$DRIVE"
 bash ./upload-lives.sh
 check "the next try uploads them, two recordings never share a name" \
@@ -86,6 +92,12 @@ check "after a restart mid-upload, the page pops up again" '[ "$(opened)" = 3 ]'
 
 check "a status note for Brandon is in Google Drive, with the end of the log" \
       'grep -q "Waiting to upload:  0" "$DRIVE/Uploader checks/Mac status.txt" && grep -q "Uploading" "$DRIVE/Uploader checks/Mac status.txt"'
+check "the note has a Now line straight after Sent, padded like the rest: \"Nothing to upload\"" \
+      'grep -A1 "^Sent: " "$NOTE" | tail -n 1 | grep -qx "Now:                Nothing to upload"'
+agos "$ROOT/app/status-sent" 360
+bash ./upload-lives.sh
+check "nothing happening: the note waits 30 minutes (not sent again after 6)" \
+      '[ "$(mtime_of "$ROOT/app/status-sent")" -lt $(( $(date +%s) - 300 )) ]'
 
 # Looking after itself
 rm -rf "$REC"
@@ -182,9 +194,16 @@ check "it never looks in Desktop, Documents or Downloads by itself (so macOS nev
 head -c 4096 /dev/zero > "$REC/finished_earlier.mp4"; ago "$REC/finished_earlier.mp4" 10
 head -c 4096 /dev/zero > "$REC/live_now.mp4"            # being written right now
 before=$(count "$DRIVE" "Salsabeel live *.mp4")
+rm -f "$ROOT/app/status-sent"
 bash "$ROOT/app/upload-lives.sh"
 check "while a live is recording, nothing uploads (the stream keeps the internet)" \
       '[ "$(count "$DRIVE" "Salsabeel live *.mp4")" = "$before" ] && [ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ] && [ -f "$ROOT/app/paused" ]'
+check "a live on: the note says \"A live is on: 1 upload waits until it stops\"" \
+      'now_is "$NOTE" "A live is on: 1 upload waits until it stops"'
+agos "$ROOT/app/status-sent" 360; head -c 1 /dev/zero >> "$REC/live_now.mp4"
+bash "$ROOT/app/upload-lives.sh"
+check "a live on: the note goes again after 5 minutes (not 30)" \
+      '[ "$(mtime_of "$ROOT/app/status-sent")" -ge $(( $(date +%s) - 60 )) ]'
 ago "$REC/live_now.mp4" 10                               # the live has ended
 bash "$ROOT/app/upload-lives.sh"
 check "once the recording stops, the uploads carry on" \
@@ -221,6 +240,8 @@ head -c 4096 /dev/zero > "$REC/when_full.mp4"; ago "$REC/when_full.mp4" 10
 bash "$ROOT/app/upload-lives.sh"
 check "Google Drive full: the live waits on the Mac, and the page says Drive is full" \
       '[ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ] && grep -q "Google Drive is full" "$PAGE" && grep -q "Google Drive is full" "$ROOT/test.log"'
+check "Google Drive full: the note says \"Google Drive is full: 1 live waits on the Mac\"" \
+      'now_is "$NOTE" "Google Drive is full: 1 live waits on the Mac"'
 setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
 
 # A short recording is a test, not a live: it goes beside the status note, never with the lives
@@ -261,10 +282,38 @@ RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
 check "Drive nearly full: only what fits is uploaded, and the other waits" \
       '[ "$(count "$DRIVE" "Salsabeel live *.mp4")" = $((before + 1)) ] && [ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ]'
 echo 100 > "$ROOT/drive-free"
+agos "$ROOT/app/status-sent" 360
 RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
 check "nothing fits: nothing is sent, and the page says Drive is full" \
       '[ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ] && grep -q "Google Drive is full" "$PAGE" && grep -q "wait on this Mac until there is room" "$ROOT/test.log"'
+check "Drive full: the note goes again after 5 minutes, and says so" \
+      '[ "$(mtime_of "$ROOT/app/status-sent")" -ge $(( $(date +%s) - 60 )) ] && now_is "$NOTE" "Google Drive is full: 1 live waits on the Mac"'
 setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
+
+# Mid-upload: the note goes up from the progress loop, in the background, with the progress in it
+cat > "$ROOT/progress-rclone" <<EOF
+#!/bin/bash
+if [ "\$1" = copyto ]; then sleep 3; fi    # a slow note must not hold up the progress loop
+if [ "\$1" = move ]; then
+    for a in "\$@"; do [ -n "\${next:-}" ] && log="\$a"; next=; [ "\$a" = --log-file ] && next=1; done
+    echo "2026/11/11 12:00:00 NOTICE:    2.384 GiB / 5.678 GiB, 42%, 10.000 MiB/s, ETA 6m12s" >> "\$log"
+    sleep 12
+fi
+exec "$RCLONE" "\$@"
+EOF
+chmod +x "$ROOT/progress-rclone"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\n' "$REC" "$DRIVE" "$ROOT/progress-rclone" > "$ROOT/app/config.sh"
+head -c 4096 /dev/zero > "$REC/watched.mp4"; ago "$REC/watched.mp4" 10
+agos "$ROOT/app/status-sent" 360
+bash "$ROOT/app/upload-lives.sh" & up=$!
+for i in $(seq 1 10); do sleep 1; now_is "$NOTE" "Uploading 42% (2.4 GB of 5.7 GB, about 6 minutes left)" && break; done
+check "mid-upload: the note goes up while it uploads, with \"Uploading 42% (2.4 GB of 5.7 GB, about 6 minutes left)\"" \
+      'kill -0 "$up" 2>/dev/null && now_is "$NOTE" "Uploading 42% (2.4 GB of 5.7 GB, about 6 minutes left)"'
+check "mid-upload: the page kept updating while the note went up" 'grep -q "Uploading 42%" "$PAGE"'
+wait "$up"
+check "after the upload, the note says \"Nothing to upload\"" \
+      'now_is "$NOTE" "Nothing to upload" && [ "$(count "$REC/Ready to upload" "*.mp4")" = 0 ]'
+setup "$DRIVE"
 
 if [ -f manifest.txt ]; then
     check "manifest.txt matches these files (run streaming-mac/build.sh after a change)" \
