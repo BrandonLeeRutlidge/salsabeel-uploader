@@ -60,7 +60,9 @@ UPDATE_EVERY=3600
 MIN_LIVE_MB="${SALSABEEL_UPLOADER_MIN_LIVE_MB:-100}"   # smaller than this, or shorter than MIN_LIVE_SECONDS,
 MIN_LIVE_SECONDS=600                                   # is a test recording, not a live
 DRIVE_MARGIN_MB=200    # room kept free in Google Drive
-STATUS_EVERY=1800
+STATUS_IDLE_EVERY=1800   # the status note: every 30 minutes when nothing is happening,
+STATUS_BUSY_EVERY=300    # every 5 while something is (an upload, a live, Drive full)
+STATUS_EVERY=$STATUS_IDLE_EVERY
 CHECKS_FOLDER="Uploader checks"
 TEMPLATE="${SALSABEEL_UPLOADER_TEMPLATE:-$APP_DIR/status-page.html}"
 PAGE="$APP_DIR/Salsabeel live uploader.html"
@@ -144,6 +146,7 @@ status_preparing() { write_status preparing "Live finished" "Getting today&#39;s
 status_uploading() {   # percent "done / total" eta
     local detail="$(human_size "${2% / *}") of $(human_size "${2#* / }") · $(time_left "$3")"
     write_status uploading "Uploading" "Uploading today&#39;s live" "$LEAVE_ON" "$1" "$detail" "Uploading $1% · Salsabeel"
+    NOW_LINE="Uploading $1% ($(human_size "${2% / *}") of $(human_size "${2#* / }"), $(time_left "$3"))"
 }
 status_done() { write_status done "Done" "The live is in Google Drive" "All done. You can turn the Mac off now." 100 "Uploaded at $(date '+%H:%M')" "Done · Salsabeel"; }
 status_paused() { write_status retry "Paused for the live" "Upload paused while you are live" "A live is on, so the upload waits and carries on by itself once the recording stops. Leave the Mac on." "${pct:-0}" "Carries on after the live" "Paused · Salsabeel"; }
@@ -220,6 +223,11 @@ update_if_due() {
 
 # --- The status note in Google Drive -----------------------------------------------------------------
 STATUS_NOW=0
+NOW_LINE=""    # one plain sentence for the note's "Now:" line (the PC status app shows it word for word)
+BUSY=""        # set when a live is on: the note goes every 5 minutes, not 30
+plural() { if [ "$1" = 1 ]; then printf '%s %s' "$1" "$2"; else printf '%s %s' "$1" "$3"; fi; }   # 1 live, 2 lives
+now_live() { NOW_LINE="A live is on: $(plural "$1" "upload waits" "uploads wait") until it stops"; BUSY=1; }
+now_full() { NOW_LINE="Google Drive is full: $(plural "$1" "live waits" "lives wait") on the Mac"; }
 send_status() {
     local note="$APP_DIR/Mac status.txt" drive mac waiting=0 ready=0 f
     mac=$(scutil --get ComputerName 2>/dev/null || hostname)
@@ -231,7 +239,8 @@ send_status() {
     {
         echo "Salsabeel live uploader: status from the streaming Mac"
         echo
-        echo "Sent:               $(date '+%Y-%m-%d %H:%M') (every 30 minutes while the Mac is on and online)"
+        echo "Sent:               $(date '+%Y-%m-%d %H:%M') (every 5 minutes while busy, otherwise every 30, while the Mac is on and online)"
+        echo "Now:                ${NOW_LINE:-Nothing to upload}"
         echo "Mac:                $mac"
         echo "Version:            $(cat "$APP_DIR/VERSION" 2>/dev/null || echo unknown)"
         echo "Recording folder:   $WATCH_DIR"
@@ -260,6 +269,11 @@ send_status() {
 }
 status_if_due() {
     local sent="$APP_DIR/status-sent"
+    STATUS_EVERY=$STATUS_IDLE_EVERY
+    if [ -n "$BUSY" ] || [ -f "$APP_DIR/paused" ] || [ -f "$APP_DIR/full-noted" ] ||
+       [ -n "$(find "$READY" -type f ! -name '.*' 2>/dev/null | head -n 1)" ]; then
+        STATUS_EVERY=$STATUS_BUSY_EVERY
+    fi
     if [ "$STATUS_NOW" = 1 ] || [ ! -f "$sent" ] || [ $(( $(date +%s) - $(mtime "$sent") )) -ge "$STATUS_EVERY" ]; then
         send_status || true
     fi
@@ -506,8 +520,12 @@ clear_copied
 pending() { find "$READY" -type f ! -name '.*' 2>/dev/null; }
 label() { pending | while IFS= read -r f; do basename "$f"; done | paste -sd ',' - | sed 's/,/, /g'; }
 waiting=$(pending | grep -c . || true)
-if [ "$waiting" -eq 0 ]; then status_if_due; exit 0; fi
+if [ "$waiting" -eq 0 ]; then
+    if recording_now; then NOW_LINE="A live is on: nothing waits to upload"; BUSY=1; fi
+    status_if_due; exit 0
+fi
 if recording_now; then   # a live is on: leave the internet to the stream
+    now_live "$waiting"
     if [ ! -f "$APP_DIR/paused" ]; then
         log "A live is recording: $waiting upload(s) wait until it stops, so the stream keeps all the internet."
         touch "$APP_DIR/paused"; STATUS_NOW=1
@@ -526,7 +544,7 @@ fi
 # Never overwrite a recording already in Google Drive: a clash gets " (2)", " (3)" and so on.
 existing=$("$RCLONE" lsf "$DEST" --files-only 2>/dev/null) ||
     { "$RCLONE" mkdir "$DEST" >/dev/null 2>&1 && existing=$("$RCLONE" lsf "$DEST" --files-only 2>/dev/null); } ||
-    { log "Google Drive is not reachable; trying again in a minute."; status_retry 0; exit 0; }
+    { log "Google Drive is not reachable; trying again in a minute."; status_retry 0; NOW_LINE="Waiting for the internet"; status_if_due; exit 0; }
 taken() { printf '%s\n' "$existing" | grep -Fxq -- "$1"; }
 for f in "$READY"/*; do
     [ -f "$f" ] || continue
@@ -563,6 +581,7 @@ if [ "$count" -eq 0 ]; then
     if [ "$(cat "$APP_DIR/full-noted" 2>/dev/null)" != "$msg" ]; then log "$msg"; echo "$msg" > "$APP_DIR/full-noted"; fi
     pct=0
     status_full
+    now_full "$waiting"
     status_if_due
     exit 0
 fi
@@ -582,6 +601,8 @@ pct=0
 ticks=0
 paused=""
 restart=""
+status_pid=""
+status_tried=0
 while kill -0 "$rclone_pid" 2>/dev/null; do
     ticks=$((ticks + 1))
     if [ $((ticks % 15)) -eq 0 ]; then   # a new version takes over now, not after a long upload
@@ -599,30 +620,49 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
         pct=$(printf '%s' "$line" | grep -oE '[0-9]+%' | tail -n 1 | tr -d '%')
         sizes=$(printf '%s' "$line" | sed -nE 's#.* ([0-9.]+ [KMGTP]?i?B) / ([0-9.]+ [KMGTP]?i?B),.*#\1 / \2#p')
         eta=$(printf '%s' "$line" | sed -nE 's/.*ETA ([^ ]+).*/\1/p')
-        if [ -n "$pct" ] && [ -n "$sizes" ]; then status_uploading "$pct" "$sizes" "$eta"; fi
+        if [ -n "$pct" ] && [ -n "$sizes" ]; then
+            status_uploading "$pct" "$sizes" "$eta"
+            # The note in Drive, mid-upload, every 5 minutes: in the background, so this loop is not held up.
+            t=$(date +%s)
+            if [ $(( t - $(mtime "$APP_DIR/status-sent" 2>/dev/null || echo 0) )) -ge "$STATUS_BUSY_EVERY" ] &&
+               [ $(( t - status_tried )) -ge "$STATUS_BUSY_EVERY" ] &&
+               { [ -z "$status_pid" ] || ! kill -0 "$status_pid" 2>/dev/null; }; then
+                status_tried=$t
+                send_status >/dev/null 2>&1 &
+                status_pid=$!
+            fi
+        fi
     fi
     sleep 2
 done
+left=$(pending | grep -c . || true)
 if [ -n "$restart" ]; then
     log "Updated mid-upload: the upload starts again with the new version in a minute."
     status_preparing
+    NOW_LINE="Uploading again in a minute, with the new version"
 elif [ -n "$paused" ]; then
     log "A live started, so the upload stopped. It carries on by itself once the recording stops."
     touch "$APP_DIR/paused"
     status_paused
+    now_live "$left"
 elif wait "$rclone_pid"; then
     log "Uploaded to $DEST"
     status_done
     notify "The live recording is in Google Drive. You can turn the Mac off."
+    NOW_LINE="Nothing to upload"
+    if [ "$left" -gt 0 ]; then now_full "$left"; fi   # only what fitted went up
 else
     grep -vE ' / .*[0-9]+%' "$PROGRESS" | tail -n 5 >> "$LOG"
     if grep -qiE 'storageQuotaExceeded|quota has been exceeded|quotaExceeded' "$PROGRESS"; then
         log "Google Drive is full: it stays in \"Ready to upload\" and is tried again in a minute."
         status_full
+        now_full "$left"
     else
         log "Upload failed; it stays in \"Ready to upload\" and is tried again in a minute."
         status_retry "${pct:-0}"
+        NOW_LINE="Waiting for the internet"
     fi
 fi
+if [ -n "$status_pid" ]; then wait "$status_pid" 2>/dev/null; fi   # never two notes going up at once
 STATUS_NOW=1
 status_if_due
