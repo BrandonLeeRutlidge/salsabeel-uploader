@@ -18,6 +18,7 @@ export SALSABEEL_UPLOADER_DIR="$ROOT/app" SALSABEEL_UPLOADER_LOG="$ROOT/test.log
 export SALSABEEL_UPLOADER_TEMPLATE="$PWD/status-page.html"
 export HOME="$ROOT/home"                          # its backup copy and background job file stay in the test folder
 export SALSABEEL_UPLOADER_RECORDER="fakerec$$x"  # only the test's pretend LIVE Studio counts, never the real one
+export SALSABEEL_UPLOADER_MIN_LIVE_MB=0           # the test videos are tiny; one check below sets a size
 export SALSABEEL_UPLOADER_TEST=1                  # it may follow recordings in temporary folders (where this test works)
 mkdir -p "$HOME"
 printf '#!/bin/bash\necho opened >> "%s"\n' "$ROOT/opened" > "$ROOT/fake-open"; chmod +x "$ROOT/fake-open"
@@ -221,6 +222,27 @@ bash "$ROOT/app/upload-lives.sh"
 check "Google Drive full: the live waits on the Mac, and the page says Drive is full" \
       '[ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ] && grep -q "Google Drive is full" "$PAGE" && grep -q "Google Drive is full" "$ROOT/test.log"'
 setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
+
+# A short recording is a test, not a live: it goes beside the status note, never with the lives
+before=$(count "$DRIVE" "Salsabeel live *.mp4")
+head -c 4096 /dev/zero > "$REC/quick_test.mp4"; ago "$REC/quick_test.mp4" 10
+setup "$DRIVE" 'MIN_LIVE_MB=1'
+bash "$ROOT/app/upload-lives.sh"
+check "a short test recording goes to Uploader checks/Short recordings, not with the lives" \
+      '[ "$(count "$DRIVE/Uploader checks/Short recordings" "Short recording *.mp4")" = 1 ] && [ "$(count "$DRIVE" "Salsabeel live *.mp4")" = "$before" ]'
+setup "$DRIVE"
+
+# A new version takes over mid-upload (the upload starts again with it)
+SITE="$ROOT/site"; mkdir -p "$SITE"; publish v9
+head -c 4096 /dev/zero > "$REC/long_upload.mp4"; ago "$REC/long_upload.mp4" 10
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=%q\nUPDATE_EVERY=20\n' "$REC" "$DRIVE" "$ROOT/slow-rclone" "file://$SITE" > "$ROOT/app/config.sh"
+echo v8 > "$ROOT/app/VERSION"; touch "$ROOT/app/update-checked"
+bash "$ROOT/app/upload-lives.sh" & up=$!
+for i in $(seq 1 60); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
+check "a new version takes over mid-upload, and the upload waits for it" \
+      '! kill -0 "$up" 2>/dev/null && [ "$(cat "$ROOT/app/VERSION")" = v9 ] && grep -q "Updated mid-upload" "$ROOT/test.log" && [ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ]'
+kill "$up" 2>/dev/null; cp upload-lives.sh "$ROOT/app/upload-lives.sh"; setup "$DRIVE"
+bash "$ROOT/app/upload-lives.sh"
 
 if [ -f manifest.txt ]; then
     check "manifest.txt matches these files (run streaming-mac/build.sh after a change)" \
