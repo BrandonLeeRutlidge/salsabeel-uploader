@@ -639,6 +639,35 @@ warn_copied() {   # a delete that failed: logged once an hour per file, with rcl
     touch "$APP_DIR/copied-failed.$key"
     log "Could not delete \"$1\" from Google Drive: ${2:-no reason given}"
 }
+# Brandon, 12 Nov 2026: "yes, empty the bin but only the live stream files".
+# Only this app's own files (drive.file), only on Google Drive, and only live recordings:
+# "Salsabeel live ..." or "Copied - Salsabeel live ..." videos. Never the status note, fix reports,
+# short recordings, or anything else; anything it isn't sure of stays.
+is_live_file() {
+    case "$1" in "$CHECKS_FOLDER"/*|*/"$CHECKS_FOLDER"/*) return 1 ;; esac
+    printf '%s' "${1##*/}" | grep -qiE '^(Copied - )?Salsabeel live .*\.(mp4|mov|m4v)$'
+}
+empty_bin() {   # [now]: once an hour (and straight after Drive reads full), delete this app's live recordings in the bin for good
+    local line size path n=0
+    is_remote && "$RCLONE" listremotes --long 2>/dev/null | grep -qE "^$REMOTE: +drive *\$" || return 0
+    if [ -z "${1:-}" ] && [ -f "$APP_DIR/bin-checked" ] &&
+       [ $(( $(date +%s) - $(mtime "$APP_DIR/bin-checked") )) -lt 3600 ]; then return 0; fi
+    touch "$APP_DIR/bin-checked"
+    "$RCLONE" lsf "$REMOTE:" -R --files-only --format sp --separator ';' --drive-trashed-only \
+        --contimeout 15s --timeout 60s > "$APP_DIR/bin-list" 2>/dev/null || return 0
+    while IFS= read -r line; do
+        size=${line%%;*}; path=${line#*;}
+        case "$size" in ''|*[!0-9]*) continue ;; esac
+        is_live_file "$path" || continue
+        if "$RCLONE" deletefile "$REMOTE:$path" --drive-trashed-only --drive-use-trash=false \
+               --contimeout 15s --timeout 60s >/dev/null 2>&1; then
+            log "Emptied from the Google Drive bin for good: \"$path\" ($(( size / 1048576 )) MB)."
+            n=$((n + 1))
+        fi
+    done < "$APP_DIR/bin-list"
+    if [ "$n" -gt 0 ]; then STATUS_NOW=1; fi
+    return 0
+}
 
 follow_live_studio
 while IFS= read -r f; do take_if_finished "$f" since; done < <(recordings)
@@ -651,6 +680,7 @@ if [ -s "$FOLLOW" ]; then
     mv -f "$FOLLOW.next" "$FOLLOW"
 fi
 clear_copied   # first: it frees space for the Drive check below
+empty_bin
 rescue_moved
 
 pending() { find "$READY" -type f ! -name '.*' 2>/dev/null; }
@@ -729,6 +759,7 @@ if [ "$count" -eq 0 ]; then
     pct=0
     status_full
     now_full "$waiting"
+    empty_bin now   # the bin may hold old lives that still count against the space
     status_if_due
     exit 0
 fi
@@ -795,7 +826,7 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
             log "The new version takes over after this upload (a live is on, so it is not started again)."
         fi
     fi
-    clear_copied   # during long (live) uploads too: only API calls (it checks every CLEAR_EVERY seconds)
+    clear_copied; empty_bin   # during long (live) uploads too: only API calls (each checks its own timer)
     if [ $((ticks % 8)) -eq 0 ]; then
         if [ "$mode" = full ] && recording_now; then   # a live has started
             full_only=""
