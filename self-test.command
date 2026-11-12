@@ -502,6 +502,50 @@ check "Drive full: copied lives are deleted every minute, before the Drive check
       '[ "$order" = "Deleted \"Copied - Salsabeel live 2026-11-04|Google Drive is full" ]'
 setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
 
+# The bin (Brandon, 12 Nov: "only the live stream files"): live recordings in this app's bin go for good; nothing else
+BIN="$ROOT/bin-drive"; rm -rf "$BIN"; mkdir -p "$BIN/Salsabeel lives/Uploader checks/Short recordings"
+head -c 2097152 /dev/zero > "$BIN/Salsabeel lives/Salsabeel live 2026-11-01 18-00.mp4"
+head -c 4096 /dev/zero > "$BIN/Salsabeel lives/Copied - Salsabeel live 2026-11-02 18-00.mp4"
+echo note > "$BIN/Salsabeel lives/Uploader checks/Mac status.txt"
+echo report > "$BIN/Salsabeel lives/Uploader checks/Fix report 2026-11-03 10-00.txt"
+head -c 4096 /dev/zero > "$BIN/Salsabeel lives/Uploader checks/Short recordings/Short recording 2026-11-03 10-00.mp4"
+head -c 4096 /dev/zero > "$BIN/Salsabeel lives/Uploader checks/Salsabeel live test.mp4"
+head -c 4096 /dev/zero > "$BIN/Salsabeel lives/holiday.mp4"
+cat > "$ROOT/bin-rclone" <<EOF
+#!/bin/bash
+# Pretend Google Drive: this remote is "drive", and --drive-trashed-only sees the pretend bin.
+if [ "\$1 \${2:-}" = "listremotes --long" ]; then echo "testdrive:           drive"; exit 0; fi
+case " \$* " in *" --drive-trashed-only "*)
+    if [ "\$1" = lsf ]; then (cd "$BIN" && find . -type f | sed 's#^\./##' | while IFS= read -r f; do echo "\$(wc -c < "\$f" | tr -d ' ');\$f"; done); exit 0; fi
+    if [ "\$1" = deletefile ]; then rm -f "$BIN/\${2#testdrive:}"; exit 0; fi
+    exit 1 ;;
+esac
+exec "$RCLONE" "\$@"
+EOF
+chmod +x "$ROOT/bin-rclone"
+printf '[testdrive]\ntype = alias\nremote = %s\n' "$ROOT/Google Drive" > "$ROOT/rclone.conf"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\n' "$REC" "testdrive:Salsabeel lives" "$ROOT/bin-rclone" > "$ROOT/app/config.sh"
+: > "$ROOT/test.log"; rm -f "$ROOT/app/bin-checked"
+RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
+check "the bin: this app's live recordings in it are deleted for good, and logged with their size" \
+      '[ ! -e "$BIN/Salsabeel lives/Salsabeel live 2026-11-01 18-00.mp4" ] && [ ! -e "$BIN/Salsabeel lives/Copied - Salsabeel live 2026-11-02 18-00.mp4" ] &&
+       grep -q "Emptied from the Google Drive bin for good: \"Salsabeel lives/Salsabeel live 2026-11-01 18-00.mp4\" (2 MB)" "$ROOT/test.log"'
+check "the bin: the status note, fix reports, short and test recordings, and other videos are never touched" \
+      '[ -e "$BIN/Salsabeel lives/Uploader checks/Mac status.txt" ] && [ -e "$BIN/Salsabeel lives/Uploader checks/Fix report 2026-11-03 10-00.txt" ] &&
+       [ -e "$BIN/Salsabeel lives/Uploader checks/Short recordings/Short recording 2026-11-03 10-00.mp4" ] &&
+       [ -e "$BIN/Salsabeel lives/Uploader checks/Salsabeel live test.mp4" ] && [ -e "$BIN/Salsabeel lives/holiday.mp4" ]'
+head -c 4096 /dev/zero > "$BIN/Salsabeel lives/Salsabeel live 2026-11-04 18-00.mp4"
+RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
+check "the bin: once an hour, not every minute" '[ -e "$BIN/Salsabeel lives/Salsabeel live 2026-11-04 18-00.mp4" ]'
+printf '[testdrive]\ntype = alias\nremote = %s\n' "$ROOT/Google Drive" > "$ROOT/rclone.conf"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\nDRIVE_MARGIN_MB=0\n' "$REC" "testdrive:Salsabeel lives" "$ROOT/bin-rclone" > "$ROOT/app/config.sh"
+printf '#!/bin/bash\nif [ "$1" = about ]; then echo "{\\"total\\":15000,\\"free\\":100}"; exit 0; fi\nexec %q "$@"\n' "$ROOT/bin-rclone" > "$ROOT/full-bin-rclone"; chmod +x "$ROOT/full-bin-rclone"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\nDRIVE_MARGIN_MB=0\n' "$REC" "testdrive:Salsabeel lives" "$ROOT/full-bin-rclone" > "$ROOT/app/config.sh"
+head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-09 19-02.mp4"
+RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
+check "the bin: straight after Drive reads full, without waiting the hour" '[ ! -e "$BIN/Salsabeel lives/Salsabeel live 2026-11-04 18-00.mp4" ] && grep -q "Google Drive is full" "$ROOT/test.log"'
+setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
+
 # The lid shut with lives waiting: the note says the Mac slept, and when
 setup "$DRIVE"; echo 12 > "$ROOT/app/waiting-count"; agos "$ROOT/app/last-run" 39600; rm -f "$ROOT/app/status-sent" "$ROOT/app/last-sleep"
 bash "$ROOT/app/upload-lives.sh"
