@@ -582,6 +582,63 @@ check "after the stall, the same upload carries on and finishes" \
       '! kill -0 "$up" 2>/dev/null && [ ! -e "$REC/Ready to upload/Salsabeel live 2026-11-12 16-02.mp4" ]'
 rm -f "$ROOT/app/last-sleep"; setup "$DRIVE"
 
+# Uploading in parts (PARTS_UPLOAD=on; off by default): Parts/<name>/part-0001 ..., the manifest last
+md5of() { if command -v md5 >/dev/null 2>&1; then md5 -q "$1"; else md5sum "$1" | cut -d' ' -f1; fi; }
+check "parts are off by default: lives go up whole" '[ ! -d "$DRIVE/Parts" ]'
+P1="Salsabeel live 2026-11-13 10-02.mp4"; PD1="$DRIVE/Parts/$P1"
+head -c 3670016 /dev/urandom > "$REC/Ready to upload/$P1"; want=$(md5of "$REC/Ready to upload/$P1")
+setup "$DRIVE" 'PARTS_UPLOAD=on
+PART_MB=1
+PART_LIVE_MB=1
+PARTS_MIN_MB=1'
+: > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+joined=$(cat "$PD1"/part-000[1-4] 2>/dev/null | { if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi; })
+check "in parts: 4 parts of 1 MiB (the last 0.5), and the manifest last, with each part's size and md5" \
+      '[ "$(ls "$PD1" | grep -c "^part-")" = 4 ] && grep -qx "clipline-parts 1" "$PD1/manifest.txt" && grep -qx "name: $P1" "$PD1/manifest.txt" &&
+       grep -qx "size: 3670016" "$PD1/manifest.txt" && grep -qx "md5: $want" "$PD1/manifest.txt" &&
+       grep -qx "part: part-0004 524288 $(md5of "$PD1/part-0004")" "$PD1/manifest.txt" && [ "$joined" = "$want" ]'
+check "in parts: nothing goes up whole, and the recording waits in .sent until the cloud has joined it" \
+      '[ ! -e "$DRIVE/$P1" ] && [ ! -e "$REC/Ready to upload/$P1" ] && [ -e "$REC/.sent/$P1" ] && grep -q "All 4 parts" "$ROOT/test.log"'
+# Stopped mid-way (part 3 fails once), and part 2 spoilt in Drive meanwhile: it carries on from part 2, never part 1
+P2="Salsabeel live 2026-11-13 16-02.mp4"; PD2="$DRIVE/Parts/$P2"
+head -c 4194304 /dev/urandom > "$REC/Ready to upload/$P2"; want2=$(md5of "$REC/Ready to upload/$P2")
+cat > "$ROOT/parts-rclone" <<EOF
+#!/bin/bash
+if [ "\$1" = rcat ]; then
+    echo "\${2##*/}" >> "$ROOT/rcat-calls"
+    if [ "\${2##*/}" = part-0003 ] && [ ! -e "$ROOT/failed-once" ]; then touch "$ROOT/failed-once"; cat > /dev/null; exit 1; fi
+fi
+exec "$RCLONE" "\$@"
+EOF
+chmod +x "$ROOT/parts-rclone"; rm -f "$ROOT/rcat-calls" "$ROOT/failed-once"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\nPARTS_UPLOAD=on\nPART_MB=1\nPART_LIVE_MB=1\nPARTS_MIN_MB=1\n' "$REC" "$DRIVE" "$ROOT/parts-rclone" > "$ROOT/app/config.sh"
+: > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+check "a stop mid-way: the parts already sent stay, and the recording waits" \
+      '[ -e "$PD2/part-0001" ] && [ -e "$PD2/part-0002" ] && [ ! -e "$PD2/manifest.txt" ] && [ -e "$REC/Ready to upload/$P2" ]'
+head -c 1048576 /dev/zero > "$PD2/part-0002"   # spoilt in Drive
+bash "$ROOT/app/upload-lives.sh"
+check "the next run carries on: a spoilt part goes again, part 1 never does, and the whole file checks out" \
+      '[ "$(grep -cx part-0001 "$ROOT/rcat-calls")" = 1 ] && [ "$(grep -cx part-0002 "$ROOT/rcat-calls")" = 2 ] &&
+       grep -q "part-0002 of \"$P2\" is not in Drive as sent" "$ROOT/test.log" && grep -qx "md5: $want2" "$PD2/manifest.txt" &&
+       [ "$(cat "$PD2"/part-000[1-4] | { if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d" " -f1; fi; })" = "$want2" ]'
+# The cloud has joined it ("Parts/Copied - <name>"): the folder and the copy here go
+mv "$PD1" "$DRIVE/Parts/Copied - $P1"; rm -f "$ROOT/app/cleared-checked"
+setup "$DRIVE" 'PARTS_UPLOAD=on'; bash "$ROOT/app/upload-lives.sh"
+check "once the cloud has joined it (Copied - …), its parts folder and the copy here are deleted, and nothing else" \
+      '[ ! -e "$DRIVE/Parts/Copied - $P1" ] && [ ! -e "$REC/.sent/$P1" ] && [ -e "$REC/.sent/$P2" ] && [ -e "$PD2/manifest.txt" ]'
+# During a live: the smaller part size, at the live speed (1.5 Mbit/s to start)
+P3="Salsabeel live 2026-11-13 19-02.mp4"; PD3="$DRIVE/Parts/$P3"; start_live
+head -c 3145728 /dev/urandom > "$REC/Ready to upload/$P3"
+trickle_setup 'PARTS_UPLOAD=on
+PART_MB=2
+PART_LIVE_MB=1
+PARTS_MIN_MB=1'
+t0=$(date +%s); : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"; took=$(( $(date +%s) - t0 ))
+stop_live; rm -f "$REC/on_air.mp4"
+check "during a live, parts are the live size (3 × 1 MiB) and go at the live speed ($took s for 3 MiB)" \
+      '[ "$(ls "$PD3" | grep -c "^part-")" = 3 ] && [ -e "$PD3/manifest.txt" ] && [ "$took" -ge 10 ] && grep -q "A live is on: uploading" "$ROOT/test.log"'
+rm -rf "$DRIVE/Parts" "$REC/.sent"; setup "$DRIVE"
+
 # The lid shut with lives waiting: the note says the Mac slept, and when
 setup "$DRIVE"; echo 12 > "$ROOT/app/waiting-count"; agos "$ROOT/app/last-run" 39600; rm -f "$ROOT/app/status-sent" "$ROOT/app/last-sleep"
 bash "$ROOT/app/upload-lives.sh"
