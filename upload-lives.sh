@@ -76,6 +76,10 @@ LIVE_GUARD_LOSS=2              # ... or more pings lost than this %: half speed 
 LIVE_PAUSE_SECONDS=600         # the pause
 LIVE_RELAX_SECONDS=600         # after trouble it stays below that speed for this long
 SLEEP_GAP_SECONDS=600          # no run for this long: the Mac was asleep (or off)
+PARTS_UPLOAD=off               # on: a live goes up in parts (Parts/<name>/part-0001...), so a stop costs one part at most.
+PART_MB=250                    #   part size at full speed ...
+PART_LIVE_MB=100               #   ... and during a live
+PARTS_MIN_MB=300               #   smaller recordings go up whole
 LINE_SAMPLE_MIN_MB=50          # a line-speed reading needs at least this much sent at full speed ...
 LINE_SAMPLE_MIN_SECONDS=60     # ... over at least this long
 CLEAR_EVERY=120                # how often it looks for lives Brandon's PC has copied (every minute while Drive is full)
@@ -638,12 +642,65 @@ rescue_moved() {   # once an hour: recordings left in a moved "Salsabeel lives" 
     done < "$APP_DIR/moved-videos"
 }
 
+# --- Uploading in parts (agreed with the cloud joiner, 14 Nov 2026) -------------------------------------
+# Drive: Parts/<name>/part-0001, part-0002 ... then manifest.txt, last:
+#   clipline-parts 1 / name: <name> / size: <bytes> / md5: <whole file> / part: part-0001 <bytes> <md5> ...
+# After joining, the cloud renames the folder "Parts/Copied - <name>"; this Mac then deletes it and its own copy.
+# The parts sent so far are kept in $APP_DIR/parts/<name>, and checked against Drive before carrying on.
+md5_stdin() { if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi; }
+md5_file() { if command -v md5 >/dev/null 2>&1; then md5 -q "$1"; else md5sum "$1" | cut -d' ' -f1; fi; }
+gib() { awk -v b="$1" 'BEGIN { printf "%.3f GiB", b / 1073741824 }'; }
+parts_prepare() {   # sets PNAME PDIR PSTATE FSIZE POFF PNUM; checks what Drive already has
+    local key listing rc line tag pn off b m keep=""
+    PNAME=$(basename "$SRC"); PDIR="$DEST/Parts/$PNAME"; FSIZE=$(fsize "$SRC")
+    key=$(printf '%s' "$PNAME" | tr -c 'A-Za-z0-9._-' '_'); mkdir -p "$APP_DIR/parts"; PSTATE="$APP_DIR/parts/$key"
+    if [ "$(sed -n 's/^size //p' "$PSTATE" 2>/dev/null)" != "$FSIZE" ]; then
+        log "Working out the checksum of \"$PNAME\" ($(( FSIZE / 1048576 )) MB) before sending it in parts."
+        printf 'size %s\nmd5 %s\n' "$FSIZE" "$(md5_file "$SRC")" > "$PSTATE"
+    fi
+    listing=$("$RCLONE" lsf "$PDIR" --files-only --format psh --hash MD5 --separator ';' --contimeout 15s --timeout 60s 2>/dev/null); rc=$?
+    POFF=0; PNUM=0
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then listing="trust"; fi   # Drive not reachable: trust what is noted here
+    while read -r tag pn off b m; do
+        [ "$tag" = part ] || continue
+        if [ "$listing" = trust ] || printf '%s\n' "$listing" | grep -qxF "$pn;$b;$m"; then
+            keep="$keep$tag $pn $off $b $m
+"; POFF=$(( off + b )); PNUM=$(( PNUM + 1 ))
+        else
+            log "Part $pn of \"$PNAME\" is not in Drive as sent: it goes again from there."; break
+        fi
+    done < "$PSTATE"
+    { grep -E '^(size|md5) ' "$PSTATE"; printf '%s' "$keep"; } > "$PSTATE.new"; mv -f "$PSTATE.new" "$PSTATE"
+    if [ "$PNUM" -gt 0 ]; then log "Carrying on with \"$PNAME\" at part $(( PNUM + 1 )): $(( POFF / 1048576 )) MB are already in Drive."; fi
+}
+parts_finish() {   # all parts are in: the manifest goes up last, and the recording moves out of "Ready to upload"
+    local tag pn off b m
+    { echo "clipline-parts 1"; echo "name: $PNAME"; echo "size: $FSIZE"; echo "md5: $(sed -n 's/^md5 //p' "$PSTATE")"
+      while read -r tag pn off b m; do [ "$tag" = part ] && echo "part: $pn $b $m"; done < "$PSTATE"; } > "$PSTATE.manifest"
+    "$RCLONE" copyto "$PSTATE.manifest" "$PDIR/manifest.txt" --contimeout 15s --timeout 60s --retries 3 >/dev/null 2>&1 || return 1
+    mkdir -p "$WATCH_DIR/.sent" && mv -f "$SRC" "$WATCH_DIR/.sent/$PNAME" || return 1
+    log "All $PNUM parts of \"$PNAME\" are in Drive, with their manifest. It is deleted here once the cloud has joined it."
+}
+clear_parts() {   # the cloud has joined a recording ("Parts/Copied - <name>"): delete that folder, and the copy here
+    local d n
+    "$RCLONE" lsf "$DEST/Parts" --dirs-only --contimeout 15s --timeout 60s 2>/dev/null | grep '^Copied - ' > "$APP_DIR/copied-parts" || return 0
+    while IFS= read -r d; do
+        n=${d%/}
+        if "$RCLONE" purge "$DEST/Parts/$n" --drive-use-trash=false --contimeout 15s --timeout 60s >/dev/null 2>&1; then
+            rm -f "$WATCH_DIR/.sent/${n#Copied - }" "$APP_DIR/parts/$(printf '%s' "${n#Copied - }" | tr -c 'A-Za-z0-9._-' '_')"*
+            log "The cloud has joined \"${n#Copied - }\": its parts folder and the copy here are deleted."
+        fi
+    done < "$APP_DIR/copied-parts"
+    return 0
+}
+
 clear_copied() {   # lives Brandon's PC has copied to its own Drive ("Copied - ..."): delete them here for good
     local f n=0 err t      # Only API calls, so it also runs during lives and mid-upload (see the upload loop).
     t=$(date +%s)
     if [ ! -f "$APP_DIR/full-noted" ] && [ -f "$APP_DIR/cleared-checked" ] &&
        [ $(( t - $(mtime "$APP_DIR/cleared-checked") )) -lt "$CLEAR_EVERY" ]; then return 0; fi
     touch "$APP_DIR/cleared-checked"
+    clear_parts
     "$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 60s 2>/dev/null | grep '^Copied - ' > "$APP_DIR/copied" || return 0
     while IFS= read -r f; do
         is_video "$f" || continue
@@ -791,10 +848,36 @@ fi
 rm -f "$APP_DIR/full-noted"
 PROGRESS="$APP_DIR/upload-progress.log"
 : > "$PROGRESS"
-args=(move "$READY" "$DEST" --files-from "$APP_DIR/to-upload" --transfers 1 --retries 3 --low-level-retries 20
-      --stats 2s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file "$PROGRESS"
-      --rc --rc-addr "127.0.0.1:$(rc_port)")   # its remote control: local only, and file actions need a password it hasn't got
-case "${args[${#args[@]}-1]}" in *:0) ;; *) RC_URL="http://${args[${#args[@]}-1]}/" ;; esac
+SRC="$READY/$(head -n 1 "$APP_DIR/to-upload")"; PARTS=""
+if [ "$PARTS_UPLOAD" = on ] && [ "$(dirname "$(head -n 1 "$APP_DIR/to-upload")")" = . ] &&
+   [ "$(fsize "$SRC")" -ge $(( PARTS_MIN_MB * 1048576 )) ]; then
+    PARTS=1; parts_prepare
+fi
+start_upload() {   # the next rclone: the whole file, or the next part; sets rclone_pid (and RC_URL)
+    local port common bytes count
+    : > "$PROGRESS"; port=$(rc_port); RC_URL=""
+    if [ "$port" != 0 ]; then RC_URL="http://127.0.0.1:$port/"; fi
+    common=(--stats 2s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file "$PROGRESS"
+            --rc --rc-addr "127.0.0.1:$port")   # its remote control: local only, and file actions need a password it hasn't got
+    if [ "$mode" = live ]; then common+=(--bwlimit "$(rate_of "$cap")"); elif [ -n "$BWLIMIT" ]; then common+=(--bwlimit "$BWLIMIT"); fi
+    if [ -n "$PARTS" ]; then
+        count=$PART_MB; if [ "$mode" = live ]; then count=$PART_LIVE_MB; fi
+        bytes=$(( count * 1048576 )); if [ $(( FSIZE - POFF )) -lt "$bytes" ]; then bytes=$(( FSIZE - POFF )); fi
+        PPART=$(printf 'part-%04d' $(( PNUM + 1 ))); PBYTES=$bytes
+        PMD5=$(dd if="$SRC" bs=1048576 skip=$(( POFF / 1048576 )) count="$count" 2>/dev/null | md5_stdin)
+        dd if="$SRC" bs=1048576 skip=$(( POFF / 1048576 )) count="$count" 2>/dev/null |
+            "$RCLONE" rcat "$PDIR/$PPART" --size "$bytes" --low-level-retries 20 "${common[@]}" &
+    else
+        "$RCLONE" move "$READY" "$DEST" --files-from "$APP_DIR/to-upload" --transfers 1 --retries 3 --low-level-retries 20 \
+            "${common[@]}" &
+    fi
+    rclone_pid=$!
+    if command -v caffeinate >/dev/null 2>&1; then caffeinate -ims -w "$rclone_pid" & fi   # no sleeping mid-upload
+}
+part_landed() {   # the part just sent: in Drive with its size and md5?
+    "$RCLONE" lsf "$PDIR" --files-only --format psh --hash MD5 --separator ';' --contimeout 15s --timeout 60s 2>/dev/null |
+        grep -qxF "$PPART;$PBYTES;$PMD5"
+}
 guard=""
 if [ -n "$LIVE" ]; then
     measure_line; base=$LAT   # the baseline: the line's delay with the stream on, while this sends nothing
@@ -806,20 +889,15 @@ if [ -n "$LIVE" ]; then
     else
         log "A live is on: uploading at $(mbit_of "$cap") Mbit/s. (Pings get no answer here, so it can't watch the line, and stays at that.)"
     fi
-    args+=(--bwlimit "$(rate_of "$cap")")
     mode=live
 else
-    log "Uploading $(head -n 1 "$APP_DIR/to-upload" | sed 's#.*/##') ($(( total / 1048576 )) MB) to $DEST"
-    if [ -n "$BWLIMIT" ]; then args+=(--bwlimit "$BWLIMIT"); fi
+    log "Uploading $(head -n 1 "$APP_DIR/to-upload" | sed 's#.*/##') ($(( total / 1048576 )) MB) to $DEST$([ -n "$PARTS" ] && echo ", in parts")"
     mode=full
 fi
 started=$(date +%s)
-full_t=$started; full_b=0   # since when (and from how many bytes sent) it has been at full speed: for the line's speed
-sent=0                      # bytes sent so far, from rclone's progress
-
-"$RCLONE" "${args[@]}" &
-rclone_pid=$!
-if command -v caffeinate >/dev/null 2>&1; then caffeinate -ims -w "$rclone_pid" & fi   # no sleeping mid-upload
+full_t=$started; full_b=${POFF:-0}   # since when (and from how many bytes sent) it has been at full speed: for the line's speed
+sent=${POFF:-0}                      # bytes sent so far, from rclone's progress
+start_upload
 stop_upload() { kill "$rclone_pid" 2>/dev/null; kill -CONT "$rclone_pid" 2>/dev/null; wait "$rclone_pid" 2>/dev/null; }
 held=""        # set while the upload is stopped to protect the stream (until this time)
 set_cap() {    # kbit/s why
@@ -839,6 +917,8 @@ waited=""
 status_pid=""
 status_tried=0
 checked=$(date +%s); good_since=$checked; bad=0; last_tick=$checked
+ok=""
+while :; do   # once for a whole file; once per part when sending in parts
 while kill -0 "$rclone_pid" 2>/dev/null; do
     ticks=$((ticks + 1))
     now_s=$(date +%s)
@@ -920,6 +1000,13 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
         sizes=$(printf '%s' "$line" | sed -nE 's#.* ([0-9.]+ [KMGTP]?i?B) / ([0-9.]+ [KMGTP]?i?B),.*#\1 / \2#p')
         eta=$(printf '%s' "$line" | sed -nE 's/.*ETA ([^ ]+).*/\1/p')
         if [ -n "$sizes" ]; then sent=$(to_bytes "${sizes% / *}"); fi
+        if [ -n "$PARTS" ] && [ -n "$sizes" ]; then   # the whole recording, not just this part
+            sent=$(( POFF + sent )); pct=$(( sent * 100 / FSIZE )); sizes="$(gib "$sent") / $(gib "$FSIZE")"
+            rate=$(printf '%s' "$line" | sed -nE 's#.*, ([0-9.]+ [KMGT]?i?B)/s,.*#\1#p')
+            if [ -n "$rate" ] && [ "$(to_bytes "$rate")" -gt 0 ]; then
+                t=$(( (FSIZE - sent) / $(to_bytes "$rate") )); eta="$(( t / 3600 ))h$(( t % 3600 / 60 ))m$(( t % 60 ))s"
+            fi
+        fi
         if [ -n "$pct" ] && [ -n "$sizes" ]; then
             if [ "$mode" = live ]; then status_slow "$pct" "$sizes"; else status_uploading "$pct" "$sizes" "$eta"; fi
         fi
@@ -937,6 +1024,14 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
     fi
     sleep 2
 done
+if ! wait "$rclone_pid"; then break; fi
+if [ -z "$PARTS" ]; then ok=1; break; fi
+if ! part_landed; then log "$PPART of \"$PNAME\" did not check out in Drive; it goes again next time."; break; fi
+printf 'part %s %s %s %s\n' "$PPART" "$POFF" "$PBYTES" "$PMD5" >> "$PSTATE"
+POFF=$(( POFF + PBYTES )); PNUM=$(( PNUM + 1 )); sent=$POFF
+if [ "$POFF" -ge "$FSIZE" ]; then parts_finish && ok=1; break; fi
+start_upload
+done
 left=$(pending | grep -c . || true)
 if [ -n "$paused" ]; then
     if [ "$LIVE_UPLOAD" = on ]; then
@@ -947,8 +1042,9 @@ if [ -n "$paused" ]; then
     fi
     status_paused
     now_live "$left"
-elif wait "$rclone_pid"; then
+elif [ -n "$ok" ]; then
     log "Uploaded to $DEST"
+    if [ -n "$PARTS" ]; then total=$FSIZE; fi
     if [ "$mode" = full ]; then line_sample $(( total - full_b )) $(( $(date +%s) - full_t )); fi   # the line's speed
     status_done
     if [ "$mode" = full ]; then notify "The live recording is in Google Drive. You can turn the Mac off."; fi

@@ -1,3 +1,3 @@
-version fdf9a899ed81
-1ee6d899461045727489514b54ba1e0fae998ae6faeaa3818553615cf3ccc75b  upload-lives.sh
+version 310fc759e288
+fa2b1cbca989ba1d77e723ea8873fb8d68de9618dc9b7c12bfa058d7727baa5c  upload-lives.sh
 fc7fb18851cb0bd52079041580200291cfb6997438b00ebb3cc61ba54d90f79d  status-page.html
