@@ -96,8 +96,8 @@ check "the page says it is waiting, tells them to leave the Mac on, and keeps re
 check "offline: the note's Now line says \"Waiting for the internet\"" \
       'now_is "$ROOT/app/Mac status.txt" "Waiting for the internet"'
 setup "$DRIVE"
-bash ./upload-lives.sh
-check "the next try uploads them, two recordings never share a name" \
+bash ./upload-lives.sh; bash ./upload-lives.sh             # one file per run, oldest first
+check "the next tries upload them, one at a time, and two recordings never share a name" \
       '[ "$(count "$DRIVE" "Salsabeel live *.mp4")" = 3 ] && [ "$(count "$REC/Ready to upload" "*.mp4")" = 0 ]'
 check "a retry does not pop the page up again (it is already open)" '[ "$(opened)" = 2 ]'
 echo stale > "$ROOT/app/page-opened-boot"; head -c 4096 /dev/zero > "$REC/Ready to upload/after-restart.mp4"
@@ -232,7 +232,7 @@ bash "$ROOT/app/upload-lives.sh"
 check "a live on: the note goes again after 5 minutes (not 30)" \
       '[ "$(mtime_of "$ROOT/app/status-sent")" -ge $(( $(date +%s) - 60 )) ]'
 ago "$REC/live_now.mp4" 10                               # the live has ended
-bash "$ROOT/app/upload-lives.sh"
+bash "$ROOT/app/upload-lives.sh"; bash "$ROOT/app/upload-lives.sh"
 check "once the recording stops, the uploads carry on" \
       '[ "$(count "$DRIVE" "Salsabeel live *.mp4")" = $((before + 2)) ] && [ ! -f "$ROOT/app/paused" ]'
 head -c 4096 /dev/zero > "$REC/big.mp4"; ago "$REC/big.mp4" 10
@@ -241,12 +241,14 @@ chmod +x "$ROOT/slow-rclone"
 printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\nLIVE_UPLOAD=off\n' "$REC" "$DRIVE" "$ROOT/slow-rclone" > "$ROOT/app/config.sh"
 bash "$ROOT/app/upload-lives.sh" & up=$!
 sleep 4; head -c 4096 /dev/zero > "$REC/live_again.mp4"   # a live starts mid-upload
-for i in $(seq 1 40); do kill -0 "$up" 2>/dev/null || break; head -c 1 /dev/zero >> "$REC/live_again.mp4"; sleep 1; done
-check "an upload already running stops when a live starts, and waits" \
-      '! kill -0 "$up" 2>/dev/null && [ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ] && grep -q "A live started, so the upload stopped" "$ROOT/test.log"'
-kill "$up" 2>/dev/null; rm -f "$REC/live_again.mp4"; setup "$DRIVE"
-bash "$ROOT/app/upload-lives.sh"
-check "after the live it carries on, from the beginning of that file" '[ "$(count "$REC/Ready to upload" "*.mp4")" = 0 ]'
+for i in $(seq 1 40); do grep -q "upload is paused until it ends" "$ROOT/test.log" && break; head -c 1 /dev/zero >> "$REC/live_again.mp4"; sleep 1; done
+check "LIVE_UPLOAD=off: an upload already running pauses when a live starts (it is not stopped or started again)" \
+      'kill -0 "$up" 2>/dev/null && [ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ] && grep -q "A live started: the upload is paused until it ends (what it has sent is kept)" "$ROOT/test.log"'
+ago "$REC/live_again.mp4" 10; mv "$REC/live_again.mp4" "$ROOT/live_again.mp4"   # the live ends
+for i in $(seq 1 90); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
+check "after the live the same upload carries on and finishes" \
+      '! kill -0 "$up" 2>/dev/null && [ "$(count "$REC/Ready to upload" "*.mp4")" = 0 ] && grep -q "The recording has stopped: the upload carries on" "$ROOT/test.log" && [ "$(grep -c "^.*  Uploading " "$ROOT/test.log")" -ge 1 ]'
+kill "$up" 2>/dev/null; rm -f "$ROOT/live_again.mp4"; setup "$DRIVE"
 
 # Brandon's PC has copied a live ("Copied - ..."): it is deleted here; the others stay
 head -c 4096 /dev/zero > "$DRIVE/Copied - Salsabeel live 2026-11-09 18-00.mp4"
@@ -280,15 +282,15 @@ check "a short test recording goes to Uploader checks/Short recordings, not with
       '[ "$(count "$DRIVE/Uploader checks/Short recordings" "Short recording *.mp4")" = 1 ] && [ "$(count "$DRIVE" "Salsabeel live *.mp4")" = "$before" ]'
 setup "$DRIVE"
 
-# A new version takes over mid-upload (the upload starts again with it)
+# A new version mid-upload at full speed: installed, but the upload is never stopped for it
 SITE="$ROOT/site"; mkdir -p "$SITE"; publish v9
 head -c 4096 /dev/zero > "$REC/long_upload.mp4"; ago "$REC/long_upload.mp4" 10
 printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=%q\nUPDATE_EVERY=20\n' "$REC" "$DRIVE" "$ROOT/slow-rclone" "file://$SITE" > "$ROOT/app/config.sh"
 echo v8 > "$ROOT/app/VERSION"; touch "$ROOT/app/update-checked"
 bash "$ROOT/app/upload-lives.sh" & up=$!
-for i in $(seq 1 60); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
-check "a new version takes over mid-upload, and the upload waits for it" \
-      '! kill -0 "$up" 2>/dev/null && [ "$(cat "$ROOT/app/VERSION")" = v9 ] && grep -q "Updated mid-upload" "$ROOT/test.log" && [ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ]'
+for i in $(seq 1 90); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
+check "a new version mid-upload is installed, and the upload carries on to the end (not started again)" \
+      '! kill -0 "$up" 2>/dev/null && [ "$(cat "$ROOT/app/VERSION")" = v9 ] && grep -q "takes over after this upload (the upload carries on)" "$ROOT/test.log" && [ "$(count "$REC/Ready to upload" "*.mp4")" = 0 ]'
 kill "$up" 2>/dev/null; cp upload-lives.sh "$ROOT/app/upload-lives.sh"; setup "$DRIVE"
 bash "$ROOT/app/upload-lives.sh"
 
@@ -430,8 +432,8 @@ rm -f "$ROOT/ping-seq"
 
 # The line's speed, for Brandon: in the note and on the page
 bash "$ROOT/app/upload-lives.sh" --status-now
-check "the note says the line's speed: \"Line: 20 Mbit/s up (measured …, last 1 upload)\", and so does the page" \
-      'grep -qE "^Line: +20 Mbit/s up \(measured [0-9]{2}:[0-9]{2}, last 1 upload\)$" "$NOTE" && grep -q "Line: 20 Mbit/s up" "$PAGE"'
+check "the note says the line's speed: \"Line: 20 Mbit/s up (measured …, best of the last 1 reading)\", and so does the page" \
+      'grep -qE "^Line: +20 Mbit/s up \(measured [0-9]{2}:[0-9]{2}, best of the last 1 reading\)$" "$NOTE" && grep -q "Line: 20 Mbit/s up" "$PAGE"'
 rm -f "$ROOT/app/line-speeds"
 bash "$ROOT/app/upload-lives.sh" --status-now
 check "not measured yet: the note says so" 'grep -qE "^Line: +not measured yet$" "$NOTE"'
@@ -546,6 +548,40 @@ RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
 check "the bin: straight after Drive reads full, without waiting the hour" '[ ! -e "$BIN/Salsabeel lives/Salsabeel live 2026-11-04 18-00.mp4" ] && grep -q "Google Drive is full" "$ROOT/test.log"'
 setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
 
+# The line's speed: the best of the last 5 readings (one slow reading must not drag the live ceiling to 1.5)
+rm -f "$ROOT/app/line-learned"; printf '60000\n7400\n' > "$ROOT/app/line-speeds"; trickle_setup ''
+best=$(bash "$ROOT/app/upload-lives.sh" --live-ceiling)
+check "the line's speed is the best recent reading: 60 and 7.4 give a live ceiling of 20 ($best)" '[ "$best" = 20.0 ]'
+# ... read from time at full speed, with sane bounds
+rm -f "$ROOT/app/line-speeds"; : > "$ROOT/test.log"
+head -c 3000000 /dev/urandom > "$REC/Ready to upload/Salsabeel live 2026-11-12 10-02.mp4"
+trickle_setup 'BWLIMIT=500k
+LINE_SAMPLE_MIN_MB=1
+LINE_SAMPLE_MIN_SECONDS=3'
+bash "$ROOT/app/upload-lives.sh"
+got=$(tail -n 1 "$ROOT/app/line-speeds" 2>/dev/null)
+check "a full-speed upload gives a line reading (about 4 Mbit/s at a 500 KiB/s cap: ${got:-none} kbit/s)" \
+      '[ -n "$got" ] && [ "$got" -ge 2500 ] && [ "$got" -le 6000 ] && grep -q "The line.s upload speed was" "$ROOT/test.log"'
+echo 999 >> "$ROOT/app/line-speeds"; rm -f "$ROOT/app/line-speeds"
+
+# A long upload keeps "last-run" fresh (launchd starts no other run meanwhile), so it is not taken for a sleep;
+# a real stall mid-upload is
+: > "$ROOT/test.log"; echo 0 > "$ROOT/app/waiting-count"
+head -c 7000000 /dev/urandom > "$REC/Ready to upload/Salsabeel live 2026-11-12 16-02.mp4"
+trickle_setup 'BWLIMIT=200k
+SLEEP_GAP_SECONDS=5'
+bash "$ROOT/app/upload-lives.sh" & up=$!
+sleep 7; fresh=$(( $(date +%s) - $(mtime_of "$ROOT/app/last-run") ))
+kill -STOP "$up"; sleep 8; kill -CONT "$up"           # the Mac "sleeps" mid-upload
+for i in $(seq 1 150); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
+slept=$(grep -c "Asleep: the Mac slept from" "$ROOT/test.log")
+check "a long upload keeps last-run fresh ($fresh s old after 7 s), so it is not taken for a sleep" '[ "$fresh" -le 3 ]'
+check "a real stall mid-upload is logged as a sleep, once ($slept), with the lives waiting" \
+      '[ "$slept" = 1 ] && grep -qE "Asleep: the Mac slept from .* with [0-9]+ lives? waiting" "$ROOT/test.log"'
+check "after the stall, the same upload carries on and finishes" \
+      '! kill -0 "$up" 2>/dev/null && [ ! -e "$REC/Ready to upload/Salsabeel live 2026-11-12 16-02.mp4" ]'
+rm -f "$ROOT/app/last-sleep"; setup "$DRIVE"
+
 # The lid shut with lives waiting: the note says the Mac slept, and when
 setup "$DRIVE"; echo 12 > "$ROOT/app/waiting-count"; agos "$ROOT/app/last-run" 39600; rm -f "$ROOT/app/status-sent" "$ROOT/app/last-sleep"
 bash "$ROOT/app/upload-lives.sh"
@@ -564,7 +600,7 @@ echo 3 > "$ROOT/app/waiting-count"; : > "$ROOT/test.log"
 head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-10 18-02.mp4"
 t0=$(date +%s)
 PATH="$ROOT/bin:$PATH" bash "$ROOT/app/upload-lives.sh" & up=$!
-for i in $(seq 1 60); do grep -q "Uploading 1 file(s)" "$ROOT/test.log" && break; sleep 1; done
+for i in $(seq 1 60); do grep -q "Uploading Salsabeel live 2026-11-10 18-02.mp4" "$ROOT/test.log" && break; sleep 1; done
 started=$(( $(date +%s) - t0 )); wait "$up"
 check "the morning: the first upload starts within seconds of waking, after the hourly checks ($started s)" \
       '[ "$started" -le 20 ] && grep -q "Uploaded to" "$ROOT/test.log" && [ "$(cat "$ROOT/app/VERSION")" = vAM ]'

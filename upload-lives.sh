@@ -76,6 +76,8 @@ LIVE_GUARD_LOSS=2              # ... or more pings lost than this %: half speed 
 LIVE_PAUSE_SECONDS=600         # the pause
 LIVE_RELAX_SECONDS=600         # after trouble it stays below that speed for this long
 SLEEP_GAP_SECONDS=600          # no run for this long: the Mac was asleep (or off)
+LINE_SAMPLE_MIN_MB=50          # a line-speed reading needs at least this much sent at full speed ...
+LINE_SAMPLE_MIN_SECONDS=60     # ... over at least this long
 CLEAR_EVERY=120                # how often it looks for lives Brandon's PC has copied (every minute while Drive is full)
 PING_HOSTS="${SALSABEEL_UPLOADER_PING_HOSTS:-1.1.1.1 8.8.8.8}"
 PING="${SALSABEEL_UPLOADER_PING:-ping}"
@@ -426,16 +428,26 @@ backup_self
 kbit_of() { awk -v m="$1" 'BEGIN { printf "%d", m * 1000 }'; }        # "1.5" Mbit/s -> 1500 kbit/s
 mbit_of() { awk -v k="$1" 'BEGIN { printf "%.1f", k / 1000 }'; }      # 1500 kbit/s -> "1.5"
 rate_of() { echo "$(( $1 * 125 / 1024 ))k"; }                          # kbit/s -> rclone's KiB/s
-line_known_kbit() {   # the line's upload speed: the middle of the last 5 full-speed uploads; "" if none yet
-    tail -n 5 "$APP_DIR/line-speeds" 2>/dev/null | grep -E '^[0-9]+$' | sort -n |
-        awk '{ a[NR] = $1 } END { if (NR) print a[int((NR + 1) / 2)] }'
+line_known_kbit() {   # the line's upload speed: the best of the last 5 full-speed readings; "" if none yet
+    tail -n 5 "$APP_DIR/line-speeds" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -n 1
+}
+to_bytes() { awk -v v="${1% *}" -v u="${1#* }" 'BEGIN { m = 1; if (u ~ /^K/) m = 1024; else if (u ~ /^M/) m = 1048576;
+    else if (u ~ /^G/) m = 1073741824; else if (u ~ /^T/) m = 1099511627776; printf "%.0f", v * m }'; }
+line_sample() {   # bytes seconds: a reading of the line, from time spent at full speed (1 to 1000 Mbit/s, or ignored)
+    local k
+    [ "$2" -ge "$LINE_SAMPLE_MIN_SECONDS" ] && [ "$1" -ge $(( LINE_SAMPLE_MIN_MB * 1048576 )) ] || return 0
+    k=$(( $1 * 8 / 1000 / $2 ))
+    if [ "$k" -lt 1000 ] || [ "$k" -gt 1000000 ]; then log "Ignored an odd line-speed reading: $(mbit_of "$k") Mbit/s."; return 0; fi
+    echo "$k" >> "$APP_DIR/line-speeds"
+    tail -n 5 "$APP_DIR/line-speeds" > "$APP_DIR/line-speeds.new"; mv -f "$APP_DIR/line-speeds.new" "$APP_DIR/line-speeds"
+    log "The line's upload speed was $(mbit_of "$k") Mbit/s (the line: $(line_report); so up to $(mbit_of "$(ceiling_kbit)") during lives)."
 }
 line_report() {   # "87 Mbit/s up (measured 20:40, last 5 uploads)" or "not measured yet"
     local l n
     l=$(line_known_kbit)
     if [ -z "$l" ]; then echo "not measured yet"; return; fi
     n=$(tail -n 5 "$APP_DIR/line-speeds" | grep -cE '^[0-9]+$')
-    echo "$(awk -v k="$l" 'BEGIN { if (k >= 10000) printf "%.0f", k / 1000; else printf "%.1f", k / 1000 }') Mbit/s up (measured $(clock_of "$(mtime "$APP_DIR/line-speeds")" '%H:%M'), last $(plural "$n" upload uploads))"
+    echo "$(awk -v k="$l" 'BEGIN { if (k >= 10000) printf "%.0f", k / 1000; else printf "%.1f", k / 1000 }') Mbit/s up (measured $(clock_of "$(mtime "$APP_DIR/line-speeds")" '%H:%M'), best of the last $(plural "$n" reading readings))"
 }
 cap_min() { kbit_of "$LIVE_UPLOAD_MIN_MBIT"; }
 reserve() { kbit_of "$LIVE_STREAM_RESERVE_MBIT"; }
@@ -472,11 +484,24 @@ current_file() {   # the first file of this upload not yet in Google Drive
     while IFS= read -r f; do if [ -e "$READY/$f" ]; then basename "$f"; return; fi; done < "$APP_DIR/to-upload"
 }
 RC_URL=""
-rc_bwlimit() {   # change rclone's speed while it runs (its remote control, local only, file actions refused)
+rc_port() {   # a free local port for rclone's remote control (so its address is known, not read from its log)
+    local p
+    for p in 5590 5591 5592 5593 5594 5595 5596 5597 5598 5599; do
+        if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then echo "$p"; return 0; fi
+    done
+    echo 0
+}
+rc_bwlimit() {   # change rclone's speed while it runs (its remote control, local only, file actions refused); 3 tries
+    local i
     if [ -z "$RC_URL" ]; then
-        RC_URL=$(sed -nE 's#.*Serving remote control on (http://127\.0\.0\.1:[0-9]+/).*#\1#p' "$PROGRESS" 2>/dev/null | head -n 1)
+        RC_URL=$(sed -nE 's#.*Serving remote control on (http://127\.0\.0\.1:[1-9][0-9]*/).*#\1#p' "$PROGRESS" 2>/dev/null | head -n 1)
     fi
-    [ -n "$RC_URL" ] && "$RCLONE" rc --url "$RC_URL" --timeout 10s core/bwlimit "rate=$1" >/dev/null 2>&1
+    [ -n "$RC_URL" ] || return 1
+    for i in 1 2 3; do
+        if "$RCLONE" rc --url "$RC_URL" --timeout 10s core/bwlimit "rate=$1" >/dev/null 2>&1; then return 0; fi
+        sleep 1
+    done
+    return 1
 }
 full_rate() { echo "${BWLIMIT:-off}"; }
 status_slow() {   # percent "done / total" eta
@@ -750,7 +775,7 @@ while IFS= read -r f; do
     if [ -z "$free" ] || [ $(( size + DRIVE_MARGIN_MB * 1048576 )) -le "$budget" ]; then
         printf '%s\n' "${f#"$READY"/}" >> "$APP_DIR/to-upload"
         budget=$(( budget - size )); total=$(( total + size )); count=$(( count + 1 ))
-        if [ -n "$LIVE" ]; then break; fi   # during a live, one at a time
+        break   # one at a time, oldest first: each file finishes before the next starts
     fi
 done < <(pending | sort)
 if [ "$count" -eq 0 ]; then
@@ -764,12 +789,12 @@ if [ "$count" -eq 0 ]; then
     exit 0
 fi
 rm -f "$APP_DIR/full-noted"
-if [ -z "$LIVE" ] && [ "$count" -lt "$waiting" ]; then log "Google Drive has room for $count of the $waiting waiting; the rest go once there is space."; fi
 PROGRESS="$APP_DIR/upload-progress.log"
 : > "$PROGRESS"
 args=(move "$READY" "$DEST" --files-from "$APP_DIR/to-upload" --transfers 1 --retries 3 --low-level-retries 20
       --stats 2s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file "$PROGRESS"
-      --rc --rc-addr 127.0.0.1:0)   # its remote control: local only, and file actions need a password it hasn't got
+      --rc --rc-addr "127.0.0.1:$(rc_port)")   # its remote control: local only, and file actions need a password it hasn't got
+case "${args[${#args[@]}-1]}" in *:0) ;; *) RC_URL="http://${args[${#args[@]}-1]}/" ;; esac
 guard=""
 if [ -n "$LIVE" ]; then
     measure_line; base=$LAT   # the baseline: the line's delay with the stream on, while this sends nothing
@@ -784,12 +809,13 @@ if [ -n "$LIVE" ]; then
     args+=(--bwlimit "$(rate_of "$cap")")
     mode=live
 else
-    log "Uploading $count file(s), $(( total / 1048576 )) MB, to $DEST"
+    log "Uploading $(head -n 1 "$APP_DIR/to-upload" | sed 's#.*/##') ($(( total / 1048576 )) MB) to $DEST"
     if [ -n "$BWLIMIT" ]; then args+=(--bwlimit "$BWLIMIT"); fi
     mode=full
 fi
-full_only=$([ "$mode" = full ] && echo 1)   # measure the line's speed only from a whole upload at full speed
 started=$(date +%s)
+full_t=$started; full_b=0   # since when (and from how many bytes sent) it has been at full speed: for the line's speed
+sent=0                      # bytes sent so far, from rclone's progress
 
 "$RCLONE" "${args[@]}" &
 rclone_pid=$!
@@ -809,47 +835,50 @@ hold() {       # stop sending, for LIVE_PAUSE_SECONDS
 pct=0
 ticks=0
 paused=""
-restart=""
-relaunch=""
+waited=""
 status_pid=""
 status_tried=0
-checked=$(date +%s); good_since=$checked; bad=0
+checked=$(date +%s); good_since=$checked; bad=0; last_tick=$checked
 while kill -0 "$rclone_pid" 2>/dev/null; do
     ticks=$((ticks + 1))
     now_s=$(date +%s)
-    if [ $((ticks % 15)) -eq 0 ]; then   # a new version takes over now, not after a long upload ...
+    if [ $(( now_s - last_tick )) -ge "$SLEEP_GAP_SECONDS" ]; then   # the Mac really slept mid-upload
+        PREV_RUN=$last_tick; echo "$waiting" > "$APP_DIR/waiting-count"; note_sleep
+    fi
+    last_tick=$now_s; touch "$APP_DIR/last-run"   # (launchd starts no other run while this one goes on)
+    if [ $((ticks % 15)) -eq 0 ]; then   # a new version is installed now, and takes over after the upload ...
         UPDATED=""
         update_if_due
-        if [ -n "$UPDATED" ]; then
-            if [ "$mode" = full ]; then stop_upload; restart=1; break; fi
-            # ... but not during a live: starting a slow upload again from the beginning would cost hours
-            log "The new version takes over after this upload (a live is on, so it is not started again)."
+        if [ -n "$UPDATED" ]; then   # ... but never by stopping an upload: that would start the file again from zero
+            log "The new version takes over after this upload (the upload carries on)."
         fi
     fi
     clear_copied; empty_bin   # during long (live) uploads too: only API calls (each checks its own timer)
     if [ $((ticks % 8)) -eq 0 ]; then
-        if [ "$mode" = full ] && recording_now; then   # a live has started
-            full_only=""
+        if [ "$mode" = full ] && recording_now; then   # a live has started: slow down (or wait), never start again
+            line_sample $(( sent - full_b )) $(( now_s - full_t ))
             if [ "$LIVE_UPLOAD" = on ] && set_cap "$(cap_min)" "a live started"; then   # (rclone answers only while running)
                 kill -STOP "$rclone_pid" 2>/dev/null; measure_line; kill -CONT "$rclone_pid" 2>/dev/null
                 base=$LAT; guard=$([ -n "$base" ] && echo 1); limit=$(ceiling_kbit)
                 log "The line's delay is ${base:-unknown} ms (measured while not uploading)."
                 mode=live; BUSY=1; checked=$(date +%s); good_since=$checked; bad=0
-            fi
-            if [ "$mode" = full ]; then   # it can't slow down: stop, and carry on after the live (or slowly next minute)
-                stop_upload; paused=1; break
+            else   # it can't slow down (or LIVE_UPLOAD=off): it waits, paused, keeping what it has sent
+                kill -STOP "$rclone_pid" 2>/dev/null
+                mode=live; waited=1; BUSY=1; touch "$APP_DIR/paused"
+                log "A live started: the upload is paused until it ends (what it has sent is kept)."
+                status_paused; now_live "$waiting"
             fi
         elif [ "$mode" = live ] && ! recording_now; then   # the live has ended: full speed at once
             kill -CONT "$rclone_pid" 2>/dev/null; held=""
-            if rc_bwlimit "$(full_rate)"; then
-                mode=full
-                log "The live has ended: uploading at full speed."
-            else
-                stop_upload; relaunch=1; break
-            fi
+            rc_bwlimit "$(full_rate)" || log "Its speed could not be raised; it carries on at the speed it had."
+            if [ -n "$waited" ]; then rm -f "$APP_DIR/paused"; waited=""; log "The recording has stopped: the upload carries on."
+            else log "The live has ended: uploading at full speed."; fi
+            mode=full; full_t=$(date +%s); full_b=$sent
         fi
     fi
-    if [ -n "$held" ]; then
+    if [ -n "$waited" ]; then
+        :   # paused until the live ends (above)
+    elif [ -n "$held" ]; then
         if [ "$now_s" -ge "$held" ]; then   # try again, at the minimum
             measure_line; base=${LAT:-$base}   # the only time the baseline is measured again: nothing is being sent
             kill -CONT "$rclone_pid" 2>/dev/null; held=""   # it carries on gently (see hold), then the minimum
@@ -890,6 +919,7 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
         pct=$(printf '%s' "$line" | grep -oE '[0-9]+%' | tail -n 1 | tr -d '%')
         sizes=$(printf '%s' "$line" | sed -nE 's#.* ([0-9.]+ [KMGTP]?i?B) / ([0-9.]+ [KMGTP]?i?B),.*#\1 / \2#p')
         eta=$(printf '%s' "$line" | sed -nE 's/.*ETA ([^ ]+).*/\1/p')
+        if [ -n "$sizes" ]; then sent=$(to_bytes "${sizes% / *}"); fi
         if [ -n "$pct" ] && [ -n "$sizes" ]; then
             if [ "$mode" = live ]; then status_slow "$pct" "$sizes"; else status_uploading "$pct" "$sizes" "$eta"; fi
         fi
@@ -908,15 +938,7 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
     sleep 2
 done
 left=$(pending | grep -c . || true)
-if [ -n "$restart" ]; then
-    log "Updated mid-upload: the upload starts again with the new version in a minute."
-    status_preparing
-    NOW_LINE="Uploading again in a minute, with the new version"
-elif [ -n "$relaunch" ]; then
-    log "The live has ended: the upload starts again at full speed in a minute."
-    status_preparing
-    NOW_LINE="Uploading again in a minute, at full speed"
-elif [ -n "$paused" ]; then
+if [ -n "$paused" ]; then
     if [ "$LIVE_UPLOAD" = on ]; then
         log "A live started, so the upload stopped. It carries on slowly in a minute."
     else
@@ -927,12 +949,7 @@ elif [ -n "$paused" ]; then
     now_live "$left"
 elif wait "$rclone_pid"; then
     log "Uploaded to $DEST"
-    secs=$(( $(date +%s) - started ))
-    if [ -n "$full_only" ] && [ "$total" -ge $(( 50 * 1048576 )) ] && [ "$secs" -ge 20 ]; then   # the line's speed
-        echo $(( total * 8 / 1000 / secs )) >> "$APP_DIR/line-speeds"
-        tail -n 5 "$APP_DIR/line-speeds" > "$APP_DIR/line-speeds.new"; mv -f "$APP_DIR/line-speeds.new" "$APP_DIR/line-speeds"
-        log "The line's upload speed was $(mbit_of $(( total * 8 / 1000 / secs ))) Mbit/s (the line: $(line_report); so up to $(mbit_of "$(ceiling_kbit)") during lives)."
-    fi
+    if [ "$mode" = full ]; then line_sample $(( total - full_b )) $(( $(date +%s) - full_t )); fi   # the line's speed
     status_done
     if [ "$mode" = full ]; then notify "The live recording is in Google Drive. You can turn the Mac off."; fi
     NOW_LINE="Nothing to upload"
