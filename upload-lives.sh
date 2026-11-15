@@ -82,6 +82,7 @@ PART_LIVE_MB=100               #   ... and during a live
 PARTS_MIN_MB=300               #   smaller recordings go up whole
 LINE_SAMPLE_MIN_MB=50          # a line-speed reading needs at least this much sent at full speed ...
 LINE_SAMPLE_MIN_SECONDS=60     # ... over at least this long
+LINE_SAMPLE_EVERY=600          # and one every 10 minutes at full speed, so a long upload cut short still gives one
 CLEAR_EVERY=120                # how often it looks for lives Brandon's PC has copied (every minute while Drive is full)
 PING_HOSTS="${SALSABEEL_UPLOADER_PING_HOSTS:-1.1.1.1 8.8.8.8}"
 PING="${SALSABEEL_UPLOADER_PING:-ping}"
@@ -196,6 +197,7 @@ if [ "${1:-}" = "--preview" ]; then   # what the page looks like mid-upload
 fi
 
 notify() {
+    if [ -n "${SALSABEEL_UPLOADER_NOTIFY:-}" ]; then "$SALSABEEL_UPLOADER_NOTIFY" "$1"; return 0; fi   # (the self-test)
     if command -v osascript >/dev/null 2>&1; then
         osascript -e "display notification \"$1\" with title \"Salsabeel live uploader\"" >/dev/null 2>&1 || true
     fi
@@ -600,6 +602,16 @@ live_studio_videos() {   # the video files LIVE Studio is recording to right now
         if grep -qxF -- "$p" "$FOLLOW" 2>/dev/null || [ $(( t - $(mtime "$p") )) -lt 90 ]; then echo "$p"; fi
     done
 }
+keep_open_note() {   # a live has ended with uploads left: ask them (once, on screen) to keep the laptop open
+    local b=0 f l m
+    while IFS= read -r f; do b=$(( b + $(fsize "$f") )); done < <(find "$READY" -type f ! -name '.*' 2>/dev/null)
+    [ "$b" -gt 0 ] || return 0
+    l=$(line_known_kbit); l=${l:-10000}
+    m=$(( b * 8 / 1000 / l / 60 + 1 ))
+    if [ "$m" -ge 90 ]; then m="$(( (m + 30) / 60 )) hours"; else m="$m minutes"; fi
+    notify "Uploading: about $m left. Please keep the laptop open."
+    log "Asked them to keep the laptop open: about $m of uploading left."
+}
 recording_now() {   # is a live on? LIVE Studio has a recording open, or a recording changed in the last 90 seconds
     local f t on=""
     on=$(live_studio_videos | head -n 1)
@@ -613,7 +625,10 @@ recording_now() {   # is a live on? LIVE Studio has a recording open, or a recor
         if [ ! -f "$APP_DIR/live-on" ]; then echo "$on" > "$APP_DIR/live-on"; log "Live started (file \"$on\")."; fi
         return 0
     fi
-    if [ -f "$APP_DIR/live-on" ]; then log "Live stopped (\"$(cat "$APP_DIR/live-on")\")."; rm -f "$APP_DIR/live-on"; fi
+    if [ -f "$APP_DIR/live-on" ]; then
+        log "Live stopped (\"$(cat "$APP_DIR/live-on")\")."; rm -f "$APP_DIR/live-on"
+        keep_open_note
+    fi
     return 1
 }
 follow_live_studio() {   # video files LIVE Studio has open outside the recording folder
@@ -932,6 +947,9 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
         if [ -n "$UPDATED" ]; then   # ... but never by stopping an upload: that would start the file again from zero
             log "The new version takes over after this upload (the upload carries on)."
         fi
+    fi
+    if [ "$mode" = full ] && [ $(( now_s - full_t )) -ge "$LINE_SAMPLE_EVERY" ]; then   # a reading every 10 minutes
+        line_sample $(( sent - full_b )) $(( now_s - full_t )); full_t=$now_s; full_b=$sent
     fi
     clear_copied; empty_bin   # during long (live) uploads too: only API calls (each checks its own timer)
     if [ $((ticks % 8)) -eq 0 ]; then

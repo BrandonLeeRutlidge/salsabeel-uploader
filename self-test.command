@@ -639,6 +639,30 @@ check "during a live, parts are the live size (3 × 1 MiB) and go at the live sp
       '[ "$(ls "$PD3" | grep -c "^part-")" = 3 ] && [ -e "$PD3/manifest.txt" ] && [ "$took" -ge 10 ] && grep -q "A live is on: uploading" "$ROOT/test.log"'
 rm -rf "$DRIVE/Parts" "$REC/.sent"; setup "$DRIVE"
 
+# A line reading every 10 minutes (4 seconds here) at full speed, so a long upload cut short still gives one
+rm -f "$ROOT/app/line-speeds"; : > "$ROOT/test.log"
+head -c 6000000 /dev/urandom > "$REC/Ready to upload/Salsabeel live 2026-11-14 10-02.mp4"
+trickle_setup 'BWLIMIT=400k
+LINE_SAMPLE_EVERY=4
+LINE_SAMPLE_MIN_MB=1
+LINE_SAMPLE_MIN_SECONDS=3'
+bash "$ROOT/app/upload-lives.sh"
+readings=$(grep -c . "$ROOT/app/line-speeds" 2>/dev/null || echo 0)
+check "a long full-speed upload gives a line reading every few minutes, not only at the end ($readings)" '[ "$readings" -ge 2 ]'
+rm -f "$ROOT/app/line-speeds"
+
+# A live ends with uploads left: one friendly note on screen to keep the laptop open (never during the live)
+printf '#!/bin/bash\necho "$1" >> "%s"\n' "$ROOT/notes-shown" > "$ROOT/fake-notify"; chmod +x "$ROOT/fake-notify"; rm -f "$ROOT/notes-shown"
+head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-14 16-02.mp4"
+start_live; setup "$DRIVE" 'LIVE_UPLOAD=off'
+SALSABEEL_UPLOADER_NOTIFY="$ROOT/fake-notify" bash "$ROOT/app/upload-lives.sh"
+during=$(cat "$ROOT/notes-shown" 2>/dev/null)
+stop_live; rm -f "$REC/on_air.mp4"
+SALSABEEL_UPLOADER_NOTIFY="$ROOT/fake-notify" bash "$ROOT/app/upload-lives.sh"
+check "a live ends with uploads left: \"Uploading: about N minutes left. Please keep the laptop open.\" once, and nothing during the live" \
+      '[ -z "$during" ] && [ "$(grep -c "^Uploading: about [0-9]* minutes left. Please keep the laptop open.$" "$ROOT/notes-shown")" = 1 ]'
+rm -f "$ROOT/app/paused"; setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
+
 # The lid shut with lives waiting: the note says the Mac slept, and when
 setup "$DRIVE"; echo 12 > "$ROOT/app/waiting-count"; agos "$ROOT/app/last-run" 39600; rm -f "$ROOT/app/status-sent" "$ROOT/app/last-sleep"
 bash "$ROOT/app/upload-lives.sh"
