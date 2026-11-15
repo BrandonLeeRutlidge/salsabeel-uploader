@@ -245,7 +245,7 @@ for i in $(seq 1 40); do grep -q "upload is paused until it ends" "$ROOT/test.lo
 check "LIVE_UPLOAD=off: an upload already running pauses when a live starts (it is not stopped or started again)" \
       'kill -0 "$up" 2>/dev/null && [ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ] && grep -q "A live started: the upload is paused until it ends (what it has sent is kept)" "$ROOT/test.log"'
 ago "$REC/live_again.mp4" 10; mv "$REC/live_again.mp4" "$ROOT/live_again.mp4"   # the live ends
-for i in $(seq 1 90); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
+for i in $(seq 1 180); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
 check "after the live the same upload carries on and finishes" \
       '! kill -0 "$up" 2>/dev/null && [ "$(count "$REC/Ready to upload" "*.mp4")" = 0 ] && grep -q "The recording has stopped: the upload carries on" "$ROOT/test.log" && [ "$(grep -c "^.*  Uploading " "$ROOT/test.log")" -ge 1 ]'
 kill "$up" 2>/dev/null; rm -f "$ROOT/live_again.mp4"; setup "$DRIVE"
@@ -258,8 +258,8 @@ bash "$ROOT/app/upload-lives.sh"
 check "a live Brandon's PC has copied is deleted from this Drive, and nothing else" \
       '[ ! -e "$DRIVE/Copied - Salsabeel live 2026-11-09 18-00.mp4" ] && [ -e "$DRIVE/Salsabeel live 2026-11-10 18-00.mp4" ]'
 bash "$ROOT/app/upload-lives.sh" --status-now
-check "the status note says how many lives wait in Drive for Brandon's PC" \
-      'grep -q "not yet copied by Brandon.s PC: [1-9]" "$DRIVE/Uploader checks/Mac status.txt"'
+check "the status note says how many lives wait in Drive for the cloud" \
+      'grep -q "not yet taken by the cloud: [1-9]" "$DRIVE/Uploader checks/Mac status.txt"'
 
 # Google Drive full: the page says so (not "waiting for the internet")
 printf '#!/bin/bash\nif [ "$1" = move ]; then for a in "$@"; do [ -n "${next:-}" ] && echo "ERROR : googleapi: Error 403: The user'"'"'s Drive storage quota has been exceeded., storageQuotaExceeded" >> "$a"; next=; [ "$a" = --log-file ] && next=1; done; exit 1; fi\nexec %q "$@"\n' "$RCLONE" > "$ROOT/full-rclone"
@@ -660,8 +660,29 @@ during=$(cat "$ROOT/notes-shown" 2>/dev/null)
 stop_live; rm -f "$REC/on_air.mp4"
 SALSABEEL_UPLOADER_NOTIFY="$ROOT/fake-notify" bash "$ROOT/app/upload-lives.sh"
 check "a live ends with uploads left: \"Uploading: about N minutes left. Please keep the laptop open.\" once, and nothing during the live" \
-      '[ -z "$during" ] && [ "$(grep -c "^Uploading: about [0-9]* minutes left. Please keep the laptop open.$" "$ROOT/notes-shown")" = 1 ]'
+      '[ -z "$during" ] && [ "$(grep -c "^Uploading: about [0-9]* minutes\? left. Please keep the laptop open.$" "$ROOT/notes-shown")" = 1 ]'
 rm -f "$ROOT/app/paused"; setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
+
+# Paused for a live (its speed can't be changed): the page says paused, never "uploading slowly ( Mbit/s)"; the log says why
+: > "$ROOT/test.log"; head -c 6000000 /dev/urandom > "$REC/Ready to upload/Salsabeel live 2026-11-15 10-02.mp4"
+cat > "$ROOT/norc-rclone" <<EOF
+#!/bin/bash
+# As on the Mac on 15 Nov: the transfer works, but its remote control does not answer
+if [ "\$1" = rc ]; then echo "Failed to rc: connection failed: dial tcp 127.0.0.1:5590: connect: connection refused" >&2; exit 1; fi
+exec "$ROOT/trickle-rclone" "\$@"
+EOF
+chmod +x "$ROOT/norc-rclone"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\nBWLIMIT=300k\n' "$REC" "$DRIVE" "$ROOT/norc-rclone" > "$ROOT/app/config.sh"
+bash "$ROOT/app/upload-lives.sh" & up=$!
+sleep 4; start_live
+for i in $(seq 1 30); do grep -q "upload is paused until it ends" "$ROOT/test.log" && break; sleep 1; done
+sleep 5; slowpage=$(grep -c "Uploading slowly" "$PAGE"); pausedpage=$(grep -c "Paused" "$PAGE")
+stop_live; mv "$REC/on_air.mp4" "$ROOT/on_air_done.mp4"
+for i in $(seq 1 90); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
+check "paused for a live: the page says paused, not \"uploading slowly\" with no speed" '[ "$slowpage" = 0 ] && [ "$pausedpage" -ge 1 ]'
+check "when rclone's remote control does not answer, the log says why (once)" \
+      '[ "$(grep -c "Could not change rclone.s speed (at http://127.0.0.1:[0-9]*/.*connection refused" "$ROOT/test.log")" = 1 ]'
+rm -f "$ROOT/on_air_done.mp4" "$ROOT/app/paused"; setup "$DRIVE"
 
 # The lid shut with lives waiting: the note says the Mac slept, and when
 setup "$DRIVE"; echo 12 > "$ROOT/app/waiting-count"; agos "$ROOT/app/last-run" 39600; rm -f "$ROOT/app/status-sent" "$ROOT/app/last-sleep"

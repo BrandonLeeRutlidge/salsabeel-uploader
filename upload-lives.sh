@@ -30,11 +30,11 @@
 # - Once an hour it looks for a moved "Salsabeel lives" folder (home folder, Movies) and uploads what is left in it.
 # - While a live is on (LIVE Studio recording), it uploads nothing, so the stream keeps all the internet. An
 #   upload already running stops when a live starts, and carries on by itself once the recording stops.
-# - Brandon's PC copies each live into his own Google Drive, then renames the original here "Copied - ...".
+# - The cloud (clipline) takes each live, then renames the original here "Copied - ..." (Brandon's PC did, before 13 Nov).
 #   Every 10 minutes this deletes those for good (only files it uploaded itself), so this Drive never fills.
 #   If it is full anyway, the lives wait on this Mac and the status page says so.
 # - A short recording (under MIN_LIVE_MB, or under MIN_LIVE_SECONDS from start to stop) is a test, not a
-#   live: it goes to "Uploader checks/Short recordings" in Drive, where Brandon's PC never makes clips of it.
+#   live: it goes to "Uploader checks/Short recordings" in Drive, where the cloud never makes clips of it.
 # - A new version can take over mid-upload: the upload stops and starts again with it a minute later.
 # - When Google Drive says how much space is left, it uploads one recording at a time, oldest first, and only
 #   those that fit (with DRIVE_MARGIN_MB to spare). Nothing is sent that Drive would refuse.
@@ -83,7 +83,7 @@ PARTS_MIN_MB=300               #   smaller recordings go up whole
 LINE_SAMPLE_MIN_MB=50          # a line-speed reading needs at least this much sent at full speed ...
 LINE_SAMPLE_MIN_SECONDS=60     # ... over at least this long
 LINE_SAMPLE_EVERY=600          # and one every 10 minutes at full speed, so a long upload cut short still gives one
-CLEAR_EVERY=120                # how often it looks for lives Brandon's PC has copied (every minute while Drive is full)
+CLEAR_EVERY=120                # how often it looks for lives the cloud has taken (every minute while Drive is full)
 PING_HOSTS="${SALSABEEL_UPLOADER_PING_HOSTS:-1.1.1.1 8.8.8.8}"
 PING="${SALSABEEL_UPLOADER_PING:-ping}"
 STATUS_IDLE_EVERY=1800   # the status note: every 30 minutes when nothing is happening,
@@ -284,7 +284,7 @@ send_status() {
         echo "Recording folder:   $WATCH_DIR"
         echo "  videos in it:     $waiting (recording, or stopped less than ${QUIET_MINUTES} minutes ago)"
         echo "Waiting to upload:  $ready"
-        if [ -n "${IN_DRIVE+x}" ]; then echo "In Google Drive, not yet copied by Brandon's PC: $IN_DRIVE"; fi
+        if [ -n "${IN_DRIVE+x}" ]; then echo "In Google Drive, not yet taken by the cloud: $IN_DRIVE"; fi
         if [ -d "$READY" ]; then for f in "$READY"/*; do [ -f "$f" ] && echo "  $(basename "$f")"; done; fi
         if [ -s "$FOLLOW" ]; then
             echo "LIVE Studio recording outside the folder (uploads when it stops):"
@@ -502,11 +502,19 @@ rc_bwlimit() {   # change rclone's speed while it runs (its remote control, loca
     if [ -z "$RC_URL" ]; then
         RC_URL=$(sed -nE 's#.*Serving remote control on (http://127\.0\.0\.1:[1-9][0-9]*/).*#\1#p' "$PROGRESS" 2>/dev/null | head -n 1)
     fi
-    [ -n "$RC_URL" ] || return 1
+    local err url logged
+    logged=$(sed -nE 's#.*Serving remote control on (http://[^ ]+/).*#\1#p' "$PROGRESS" 2>/dev/null | head -n 1)
     for i in 1 2 3; do
-        if "$RCLONE" rc --url "$RC_URL" --timeout 10s core/bwlimit "rate=$1" >/dev/null 2>&1; then return 0; fi
+        for url in $RC_URL $logged; do   # the address it was given, or the one rclone says it serves on
+            if err=$("$RCLONE" rc --url "$url" --timeout 10s core/bwlimit "rate=$1" 2>&1); then RC_URL=$url; return 0; fi
+        done
         sleep 1
     done
+    if [ "$(cat "$APP_DIR/rc-failed" 2>/dev/null)" != "$rclone_pid" ]; then   # why, once per upload (for Brandon)
+        echo "$rclone_pid" > "$APP_DIR/rc-failed"
+        log "Could not change rclone's speed (at ${RC_URL:-no address}${logged:+, or $logged}): $(printf '%s' "$err" | grep -v '^$' | tail -n 1)."
+        log "  rclone's own words: $(grep -iE 'remote control|rc server|listen' "$PROGRESS" 2>/dev/null | tail -n 1)"
+    fi
     return 1
 }
 full_rate() { echo "${BWLIMIT:-off}"; }
@@ -608,7 +616,7 @@ keep_open_note() {   # a live has ended with uploads left: ask them (once, on sc
     [ "$b" -gt 0 ] || return 0
     l=$(line_known_kbit); l=${l:-10000}
     m=$(( b * 8 / 1000 / l / 60 + 1 ))
-    if [ "$m" -ge 90 ]; then m="$(( (m + 30) / 60 )) hours"; else m="$m minutes"; fi
+    if [ "$m" -ge 90 ]; then m="$(( (m + 30) / 60 )) hours"; else m=$(plural "$m" minute minutes); fi
     notify "Uploading: about $m left. Please keep the laptop open."
     log "Asked them to keep the laptop open: about $m of uploading left."
 }
@@ -709,7 +717,7 @@ clear_parts() {   # the cloud has joined a recording ("Parts/Copied - <name>"): 
     return 0
 }
 
-clear_copied() {   # lives Brandon's PC has copied to its own Drive ("Copied - ..."): delete them here for good
+clear_copied() {   # lives the cloud has taken ("Copied - ..."): delete them here for good
     local f n=0 err t      # Only API calls, so it also runs during lives and mid-upload (see the upload loop).
     t=$(date +%s)
     if [ ! -f "$APP_DIR/full-noted" ] && [ -f "$APP_DIR/cleared-checked" ] &&
@@ -720,7 +728,7 @@ clear_copied() {   # lives Brandon's PC has copied to its own Drive ("Copied - .
     while IFS= read -r f; do
         is_video "$f" || continue
         if err=$("$RCLONE" deletefile "$DEST/$f" --drive-use-trash=false --contimeout 15s --timeout 60s 2>&1); then
-            log "Deleted \"$f\" from this Google Drive: Brandon's PC has its own copy."
+            log "Deleted \"$f\" from this Google Drive: the cloud has its own copy."
             n=$((n + 1))
         else
             warn_copied "$f" "$(printf '%s' "$err" | tail -n 1)"
@@ -1026,7 +1034,8 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
             fi
         fi
         if [ -n "$pct" ] && [ -n "$sizes" ]; then
-            if [ "$mode" = live ]; then status_slow "$pct" "$sizes"; else status_uploading "$pct" "$sizes" "$eta"; fi
+            if [ -n "$waited" ]; then :   # paused until the live ends: the page and Now line say so (not "uploading slowly")
+            elif [ "$mode" = live ]; then status_slow "$pct" "$sizes"; else status_uploading "$pct" "$sizes" "$eta"; fi
         fi
     fi
     # The note in Drive, mid-upload, every 5 minutes: in the background, so this loop is not held up.
