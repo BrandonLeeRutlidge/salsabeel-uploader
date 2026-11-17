@@ -506,7 +506,9 @@ rc_bwlimit() {   # change rclone's speed while it runs (its remote control, loca
     logged=$(sed -nE 's#.*Serving remote control on (http://[^ ]+/).*#\1#p' "$PROGRESS" 2>/dev/null | head -n 1)
     for i in 1 2 3; do
         for url in $RC_URL $logged; do   # the address it was given, or the one rclone says it serves on
-            if err=$("$RCLONE" rc --url "$url" --timeout 10s core/bwlimit "rate=$1" 2>&1); then RC_URL=$url; return 0; fi
+            if err=$("$RCLONE" rc --url "$url" --user salsabeel --pass "$RC_PASS" --timeout 10s core/bwlimit "rate=$1" 2>&1); then
+                RC_URL=$url; return 0
+            fi
         done
         sleep 1
     done
@@ -880,9 +882,16 @@ start_upload() {   # the next rclone: the whole file, or the next part; sets rcl
     local port common bytes count
     : > "$PROGRESS"; port=$(rc_port); RC_URL=""
     if [ "$port" != 0 ]; then RC_URL="http://127.0.0.1:$port/"; fi
+    # Its remote control: local only, with a new random password each time. Newer rclone needs a login even to change
+    # the speed ("authentication must be set up on the rc server to use core/bwlimit", seen on the Mac, 16 Nov).
+    RC_PASS=$(od -An -N12 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    if [ -z "$RC_PASS" ]; then RC_PASS="p$RANDOM$RANDOM$RANDOM"; fi
     common=(--stats 2s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file "$PROGRESS"
-            --rc --rc-addr "127.0.0.1:$port")   # its remote control: local only, and file actions need a password it hasn't got
-    if [ "$mode" = live ]; then common+=(--bwlimit "$(rate_of "$cap")"); elif [ -n "$BWLIMIT" ]; then common+=(--bwlimit "$BWLIMIT"); fi
+            --rc --rc-addr "127.0.0.1:$port" --rc-user salsabeel --rc-pass "$RC_PASS")
+    USR2=""   # rclone toggles its --bwlimit on and off on SIGUSR2: a second way to slow it, if its remote control fails
+    if [ "$mode" = live ]; then common+=(--bwlimit "$(rate_of "$cap")")
+    elif [ -n "$BWLIMIT" ]; then common+=(--bwlimit "$BWLIMIT")
+    else USR2_RATE=$(ceiling_kbit); common+=(--bwlimit "$(rate_of "$USR2_RATE")"); USR2=starting; fi   # full speed once it runs
     if [ -n "$PARTS" ]; then
         count=$PART_MB; if [ "$mode" = live ]; then count=$PART_LIVE_MB; fi
         bytes=$(( count * 1048576 )); if [ $(( FSIZE - POFF )) -lt "$bytes" ]; then bytes=$(( FSIZE - POFF )); fi
@@ -959,6 +968,9 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
     if [ "$mode" = full ] && [ $(( now_s - full_t )) -ge "$LINE_SAMPLE_EVERY" ]; then   # a reading every 10 minutes
         line_sample $(( sent - full_b )) $(( now_s - full_t )); full_t=$now_s; full_b=$sent
     fi
+    if [ "$USR2" = starting ] && grep -q '%' "$PROGRESS" 2>/dev/null; then   # running (signals before that would stop it)
+        kill -USR2 "$rclone_pid" 2>/dev/null && USR2=off                         # full speed
+    fi
     clear_copied; empty_bin   # during long (live) uploads too: only API calls (each checks its own timer)
     if [ $((ticks % 8)) -eq 0 ]; then
         if [ "$mode" = full ] && recording_now; then   # a live has started: slow down (or wait), never start again
@@ -968,6 +980,13 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
                 base=$LAT; guard=$([ -n "$base" ] && echo 1); limit=$(ceiling_kbit)
                 log "The line's delay is ${base:-unknown} ms (measured while not uploading)."
                 mode=live; BUSY=1; checked=$(date +%s); good_since=$checked; bad=0
+            elif [ "$LIVE_UPLOAD" = on ] && { [ "$USR2" = starting ] || { [ "$USR2" = off ] && kill -USR2 "$rclone_pid" 2>/dev/null; }; }; then
+                # its remote control did not answer: the signal puts it back to the live ceiling it started with
+                USR2=on; cap=$USR2_RATE; limit=$cap
+                kill -STOP "$rclone_pid" 2>/dev/null; measure_line; kill -CONT "$rclone_pid" 2>/dev/null
+                base=$LAT; guard=$([ -n "$base" ] && echo 1)
+                log "Upload speed during the live: $(mbit_of "$cap") Mbit/s (set by signal: its remote control did not answer). The line's delay is ${base:-unknown} ms; it pauses if the stream suffers."
+                mode=live; BUSY=1; checked=$(date +%s); good_since=$checked; bad=0
             else   # it can't slow down (or LIVE_UPLOAD=off): it waits, paused, keeping what it has sent
                 kill -STOP "$rclone_pid" 2>/dev/null
                 mode=live; waited=1; BUSY=1; touch "$APP_DIR/paused"
@@ -976,7 +995,9 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
             fi
         elif [ "$mode" = live ] && ! recording_now; then   # the live has ended: full speed at once
             kill -CONT "$rclone_pid" 2>/dev/null; held=""
-            rc_bwlimit "$(full_rate)" || log "Its speed could not be raised; it carries on at the speed it had."
+            if rc_bwlimit "$(full_rate)"; then :
+            elif [ "$USR2" = on ] && kill -USR2 "$rclone_pid" 2>/dev/null; then USR2=off   # (by signal)
+            else log "Its speed could not be raised; it carries on at the speed it had."; fi
             if [ -n "$waited" ]; then rm -f "$APP_DIR/paused"; waited=""; log "The recording has stopped: the upload carries on."
             else log "The live has ended: uploading at full speed."; fi
             mode=full; full_t=$(date +%s); full_b=$sent

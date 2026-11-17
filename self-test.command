@@ -324,6 +324,7 @@ cat > "$ROOT/progress-rclone" <<EOF
 #!/bin/bash
 if [ "\$1" = copyto ]; then sleep 3; fi    # a slow note must not hold up the progress loop
 if [ "\$1" = move ]; then
+    trap ':' USR2   # (like rclone: SIGUSR2 toggles its speed limit; it does not stop it)
     for a in "\$@"; do [ -n "\${next:-}" ] && log="\$a"; next=; [ "\$a" = --log-file ] && next=1; done
     echo "2026/11/11 12:00:00 NOTICE:    2.384 GiB / 5.678 GiB, 42%, 10.000 MiB/s, ETA 6m12s" >> "\$log"
     sleep 12
@@ -348,6 +349,10 @@ setup "$DRIVE"
 cat > "$ROOT/trickle-rclone" <<EOF
 #!/bin/bash
 if [ "\$1" = move ]; then exec "$RCLONE" "\$@" --disable Move; fi   # copy for real, so the speed cap shows
+if [ "\$1" = rc ]; then   # like newer rclone (the Mac's): changing the speed needs a login
+    case " \$* " in *" --user salsabeel --pass "*) ;; *)
+        echo 'Failed to rc: operation "core/bwlimit" failed: authentication must be set up on the rc server to use "core/bwlimit"' >&2; exit 1 ;; esac
+fi
 exec "$RCLONE" "\$@"
 EOF
 chmod +x "$ROOT/trickle-rclone"
@@ -683,6 +688,37 @@ check "paused for a live: the page says paused, not \"uploading slowly\" with no
 check "when rclone's remote control does not answer, the log says why (once)" \
       '[ "$(grep -c "Could not change rclone.s speed (at http://127.0.0.1:[0-9]*/.*connection refused" "$ROOT/test.log")" = 1 ]'
 rm -f "$ROOT/on_air_done.mp4" "$ROOT/app/paused"; setup "$DRIVE"
+
+# Its remote control does not answer (as on the Mac, 15–17 Nov): the speed limit is toggled by signal instead (SIGUSR2),
+# so the upload goes on at the live ceiling during a live, not paused, and at full speed again after it
+cat > "$ROOT/usr2-rclone" <<EOF
+#!/bin/bash
+# A pretend rclone: its remote control never answers; SIGUSR2 toggles its limit (noted); the move takes 50 s
+if [ "\$1" = rc ]; then echo "Failed to rc: connection failed: connect: connection refused" >&2; exit 1; fi
+if [ "\$1" = move ]; then
+    trap 'echo usr2 >> "$ROOT/usr2-calls"' USR2
+    for a in "\$@"; do [ -n "\${next:-}" ] && log="\$a"; next=; [ "\$a" = --log-file ] && next=1; done
+    for i in \$(seq 1 50); do echo "2026/11/17 16:00:00 NOTICE:    \$i MiB / 50 MiB, \$(( i * 2 ))%, 1.000 MiB/s, ETA 1s" >> "\$log"; sleep 1; done
+    exec "$RCLONE" "\$@"
+fi
+exec "$RCLONE" "\$@"
+EOF
+chmod +x "$ROOT/usr2-rclone"; rm -f "$ROOT/usr2-calls"; : > "$ROOT/test.log"
+echo 90000 > "$ROOT/app/line-speeds"   # a 90 Mbit/s line: a live ceiling of 20
+head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-17 10-02.mp4"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\n' "$REC" "$DRIVE" "$ROOT/usr2-rclone" > "$ROOT/app/config.sh"
+bash "$ROOT/app/upload-lives.sh" & up=$!
+sleep 6; start_live
+for i in $(seq 1 40); do grep -q "set by signal" "$ROOT/test.log" && break; sleep 1; done
+sleep 3; during=$(grep -c . "$ROOT/usr2-calls" 2>/dev/null)
+stop_live; mv "$REC/on_air.mp4" "$ROOT/on_air_done.mp4"
+for i in $(seq 1 120); do kill -0 "$up" 2>/dev/null || break; sleep 1; done
+after=$(grep -c . "$ROOT/usr2-calls" 2>/dev/null)
+check "no remote control: full speed by signal once it runs, then the live ceiling by signal when a live starts (not paused)" \
+      '[ "$during" = 2 ] && grep -q "Upload speed during the live: 20.0 Mbit/s (set by signal" "$ROOT/test.log" && ! grep -q "paused until it ends" "$ROOT/test.log"'
+check "no remote control: back to full speed by signal when the live ends, and the upload finishes" \
+      '[ "$after" = 3 ] && grep -q "The live has ended: uploading at full speed" "$ROOT/test.log" && [ ! -e "$REC/Ready to upload/Salsabeel live 2026-11-17 10-02.mp4" ]'
+rm -f "$ROOT/on_air_done.mp4" "$ROOT/app/line-speeds"; setup "$DRIVE"
 
 # The lid shut with lives waiting: the note says the Mac slept, and when
 setup "$DRIVE"; echo 12 > "$ROOT/app/waiting-count"; agos "$ROOT/app/last-run" 39600; rm -f "$ROOT/app/status-sent" "$ROOT/app/last-sleep"
