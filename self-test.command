@@ -310,6 +310,8 @@ before=$(count "$DRIVE" "Salsabeel live *.mp4")
 RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
 check "Drive nearly full: only what fits is uploaded, and the other waits" \
       '[ "$(count "$DRIVE" "Salsabeel live *.mp4")" = $((before + 1)) ] && [ "$(count "$REC/Ready to upload" "*.mp4")" = 1 ]'
+check "one uploaded, one waiting: the note says so (not \"Drive is full\")" \
+      'now_is "$NOTE" "Uploaded one: 1 live waits, the next starts within a minute"'
 echo 100 > "$ROOT/drive-free"
 agos "$ROOT/app/status-sent" 360
 RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
@@ -771,7 +773,11 @@ check "a live starts: \"Who are you?\" shows the names from Drive, once" \
       '[ "$(cat "$ROOT/asked")" = "Alice Bea Cara" ] && grep -q "Asked \"Who are you?\"" "$ROOT/test.log"'
 check "the answer is kept on the Mac until the recording has its name" \
       '[ "$(cat "$ROOT/app/presenters/"*.names)" = Bea ] && grep -q "on this live: Bea (clicked)" "$ROOT/test.log"'
+check "the note says the live is on, and who clicked, at once (for the live screen)" \
+      'grep -qE "^Live: +on since [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$" "$NOTE" && grep -qx "Presenters:         Bea" "$NOTE" && [ ! -e "$ROOT/app/status-due" ]'
 stop_live; ago "$REC/on_air.mp4" 10; : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+check "the live stops: the note says \"Live: off\" (and no presenters line)" \
+      'grep -qx "Live:               off" "$NOTE" && ! grep -q "^Presenters:" "$NOTE"'
 VID=$(cd "$DRIVE" && ls Salsabeel\ live\ *.mp4 2>/dev/null | while IFS= read -r v; do [ -f "$v.presenters.txt" ] && echo "$v"; done | head -n 1)
 check "once the live has stopped: \"<recording>.presenters.txt\" goes next to it in Drive, with the name clicked" \
       '[ -n "$VID" ] && [ "$(cat "$DRIVE/$VID.presenters.txt")" = Bea ] && [ -z "$(ls "$ROOT/app/presenters/")" ]'

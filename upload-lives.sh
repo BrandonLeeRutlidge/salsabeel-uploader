@@ -269,8 +269,17 @@ BUSY=""        # set when a live is on: the note goes every 5 minutes, not 30
 plural() { if [ "$1" = 1 ]; then printf '%s %s' "$1" "$2"; else printf '%s %s' "$1" "$3"; fi; }   # 1 live, 2 lives
 now_live() { NOW_LINE="A live is on: $(plural "$1" "upload waits" "uploads wait") until it stops"; BUSY=1; }
 now_full() { NOW_LINE="Google Drive is full: $(plural "$1" "live waits" "lives wait") on the Mac"; }
+utc_of() { if [ "$(uname)" = "Darwin" ]; then date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ'; else date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ'; fi; }
+live_presenters() {   # the name(s) clicked for the live on now, comma-separated ("" if none yet)
+    local s on
+    on=$(cat "$APP_DIR/live-on" 2>/dev/null) || return 0
+    for s in "$PRES"/*.src; do
+        if [ "$(cat "$s")" = "$on" ] && [ -s "${s%.src}.names" ]; then paste -sd ',' "${s%.src}.names" | sed 's/,/, /g'; return 0; fi
+    done
+}
 send_status() {
-    local note="$APP_DIR/Mac status.txt" drive mac waiting=0 ready=0 f
+    local note="$APP_DIR/Mac status.txt" drive mac waiting=0 ready=0 f who
+    rm -f "$APP_DIR/status-due"   # (set again below if this one doesn't go)
     mac=$(scutil --get ComputerName 2>/dev/null || hostname)
     if [ -d "$WATCH_DIR" ]; then waiting=$(recordings | wc -l | tr -d ' '); fi
     if [ -d "$READY" ]; then ready=$(count_videos "$READY"); fi
@@ -282,6 +291,12 @@ send_status() {
         echo
         echo "Sent:               $(date '+%Y-%m-%d %H:%M') (every 5 minutes while busy, otherwise every 30, while the Mac is on and online)"
         echo "Now:                ${NOW_LINE:-Nothing to upload}"
+        if [ -f "$APP_DIR/live-on" ]; then   # for the live screen: sent within a minute of each change
+            echo "Live:               on since $(utc_of "$(mtime "$APP_DIR/live-on")")"
+            who=$(live_presenters); if [ -n "$who" ]; then echo "Presenters:         $who"; fi
+        else
+            echo "Live:               off"
+        fi
         if [ -f "$APP_DIR/last-sleep" ] && [ $(( $(date +%s) - $(mtime "$APP_DIR/last-sleep") )) -lt 86400 ]; then
             echo "Asleep:             $(cat "$APP_DIR/last-sleep")"
         fi
@@ -310,6 +325,7 @@ send_status() {
         touch "$APP_DIR/status-sent"
         return 0
     fi
+    touch "$APP_DIR/status-due"
     return 1
 }
 status_if_due() {
@@ -319,7 +335,7 @@ status_if_due() {
        [ -n "$(find "$READY" -type f ! -name '.*' 2>/dev/null | head -n 1)" ]; then
         STATUS_EVERY=$STATUS_BUSY_EVERY
     fi
-    if [ "$STATUS_NOW" = 1 ] || [ ! -f "$sent" ] || [ $(( $(date +%s) - $(mtime "$sent") )) -ge "$STATUS_EVERY" ]; then
+    if [ "$STATUS_NOW" = 1 ] || [ -f "$APP_DIR/status-due" ] || [ ! -f "$sent" ] || [ $(( $(date +%s) - $(mtime "$sent") )) -ge "$STATUS_EVERY" ]; then
         send_status || true
     fi
 }
@@ -635,7 +651,8 @@ keep_open_note() {   # a live has ended with uploads left: ask them (once, on sc
 PRES="$APP_DIR/presenters"   # per live: <id>.src (the file LIVE Studio records to), <id>.names (the answer),
                              # <id>.name (the recording's name in Drive, once it has one)
 presenter_names() {   # the names to tick: one per line; blank lines and lines starting # left out
-    tr -d '\r' < "$APP_DIR/presenters.txt" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
+    [ -f "$APP_DIR/presenters.txt" ] || return 0
+    tr -d '\r' < "$APP_DIR/presenters.txt" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
         grep -v '^#' | grep -v '^$' || true
 }
 read_presenters() {   # the names list from Drive (every PRESENTERS_EVERY). The Mac can only see files it made itself,
@@ -720,6 +737,7 @@ ask_window() {   # base names...: on this Mac's screen; the name clicked goes to
     n=$(grep -c . "$base.ticked" || true)
     if [ "$n" -gt 0 ] && [ -f "$base.src" ]; then
         mv -f "$base.ticked" "$base.names"
+        touch "$APP_DIR/status-due"   # the note says who it is within a minute
         log "Who's on this live: $(paste -sd ',' "$base.names" | sed 's/,/, /g') (clicked)."
     else
         rm -f "$base.ticked"
@@ -783,13 +801,13 @@ recording_now() {   # is a live on? LIVE Studio has a recording open, or a recor
     fi
     if [ -n "$on" ]; then
         if [ ! -f "$APP_DIR/live-on" ]; then
-            echo "$on" > "$APP_DIR/live-on"; log "Live started (file \"$on\")."
+            echo "$on" > "$APP_DIR/live-on"; log "Live started (file \"$on\")."; touch "$APP_DIR/status-due"
             ask_presenters "$on"
         fi
         return 0
     fi
     if [ -f "$APP_DIR/live-on" ]; then
-        log "Live stopped (\"$(cat "$APP_DIR/live-on")\")."; rm -f "$APP_DIR/live-on"
+        log "Live stopped (\"$(cat "$APP_DIR/live-on")\")."; rm -f "$APP_DIR/live-on"; touch "$APP_DIR/status-due"
         keep_open_note
     fi
     return 1
@@ -1225,8 +1243,9 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
     # The note in Drive, mid-upload, every 5 minutes: in the background, so this loop is not held up.
     if [ -n "$NOW_LINE" ]; then
         t=$(date +%s)
-        if [ $(( t - $(mtime "$APP_DIR/status-sent" 2>/dev/null || echo 0) )) -ge "$STATUS_BUSY_EVERY" ] &&
-           [ $(( t - status_tried )) -ge "$STATUS_BUSY_EVERY" ] &&
+        if { { [ -f "$APP_DIR/status-due" ] && [ $(( t - status_tried )) -ge 30 ]; } ||
+             { [ $(( t - $(mtime "$APP_DIR/status-sent" 2>/dev/null || echo 0) )) -ge "$STATUS_BUSY_EVERY" ] &&
+               [ $(( t - status_tried )) -ge "$STATUS_BUSY_EVERY" ]; }; } &&
            { [ -z "$status_pid" ] || ! kill -0 "$status_pid" 2>/dev/null; }; then
             status_tried=$t
             send_status >/dev/null 2>&1 &
@@ -1261,7 +1280,7 @@ elif [ -n "$ok" ]; then
     if [ "$mode" = full ]; then notify "The live recording is in Google Drive. You can turn the Mac off."; fi
     NOW_LINE="Nothing to upload"
     if [ "$mode" = live ] && [ "$left" -gt 0 ]; then NOW_LINE="A live is on: $(plural "$left" "upload waits" "uploads wait"), the next goes slowly in a minute"
-    elif [ "$left" -gt 0 ]; then now_full "$left"; fi   # only what fitted went up
+    elif [ "$left" -gt 0 ]; then NOW_LINE="Uploaded one: $(plural "$left" "live waits" "lives wait"), the next starts within a minute"; fi
 else
     grep -vE ' / .*[0-9]+%' "$PROGRESS" | tail -n 5 >> "$LOG"
     if grep -qiE 'storageQuotaExceeded|quota has been exceeded|quotaExceeded' "$PROGRESS"; then
