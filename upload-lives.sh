@@ -90,6 +90,13 @@ STATUS_IDLE_EVERY=1800   # the status note: every 30 minutes when nothing is hap
 STATUS_BUSY_EVERY=300    # every 5 while something is (an upload, a live, Drive full)
 STATUS_EVERY=$STATUS_IDLE_EVERY
 CHECKS_FOLDER="Uploader checks"
+# "Who are you?": when a live starts, a button per presenter; one click saves it (on this Mac's screen only).
+# The names come from "Uploader checks/Presenters.txt" in Drive (the cloud fills it; never from the update repo).
+# The answer goes next to the live in Drive as "<recording>.presenters.txt", one name per line.
+PRESENTERS_ASK=on
+PRESENTERS_WAIT="${SALSABEEL_UPLOADER_ASK_WAIT:-600}"   # the list closes by itself after this long
+PRESENTERS_EVERY=600           # how often it reads the names again
+ASK="${SALSABEEL_UPLOADER_ASK:-}"   # (the self-test: a pretend list)
 TEMPLATE="${SALSABEEL_UPLOADER_TEMPLATE:-$APP_DIR/status-page.html}"
 PAGE="$APP_DIR/Salsabeel live uploader.html"
 export LC_NUMERIC=C
@@ -587,8 +594,10 @@ take_if_finished() {   # path [since]: a stopped recording goes into "Ready to u
     if mv -n "$f" "$target" 2>/dev/null && [ -e "$target" ] && [ ! -e "$f" ]; then
         if [ -n "$short" ]; then
             log "Short recording (a test?): \"${f#"$WATCH_DIR"/}\" goes to \"$CHECKS_FOLDER/Short recordings\", not with the lives."
+            presenters_named "$f" "$target" short
         else
             log "Recording finished: \"${f#"$WATCH_DIR"/}\" is now \"$(basename "$target")\""
+            presenters_named "$f" "$target"
             finished=$((finished + 1))
         fi
         return 0
@@ -622,6 +631,147 @@ keep_open_note() {   # a live has ended with uploads left: ask them (once, on sc
     notify "Uploading: about $m left. Please keep the laptop open."
     log "Asked them to keep the laptop open: about $m of uploading left."
 }
+# --- "Who are you?" (who is on this live) ------------------------------------------------------------------------
+PRES="$APP_DIR/presenters"   # per live: <id>.src (the file LIVE Studio records to), <id>.names (the answer),
+                             # <id>.name (the recording's name in Drive, once it has one)
+presenter_names() {   # the names to tick: one per line; blank lines and lines starting # left out
+    tr -d '\r' < "$APP_DIR/presenters.txt" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
+        grep -v '^#' | grep -v '^$' || true
+}
+read_presenters() {   # the names list from Drive (every PRESENTERS_EVERY). The Mac can only see files it made itself,
+    local t list n     # so if there is none it makes one (no names in it) for the cloud to fill in.
+    [ "$PRESENTERS_ASK" = on ] || return 0
+    t=$(date +%s)
+    if [ -f "$APP_DIR/presenters-checked" ] && [ $(( t - $(mtime "$APP_DIR/presenters-checked") )) -lt "$PRESENTERS_EVERY" ]; then return 0; fi
+    touch "$APP_DIR/presenters-checked"
+    list=$("$RCLONE" lsf "$DEST/$CHECKS_FOLDER" --files-only --contimeout 15s --timeout 30s 2>/dev/null) || return 0
+    if printf '%s\n' "$list" | grep -qxF 'Presenters.txt'; then
+        "$RCLONE" cat "$DEST/$CHECKS_FOLDER/Presenters.txt" --contimeout 15s --timeout 30s > "$APP_DIR/presenters.new" 2>/dev/null &&
+            [ -s "$APP_DIR/presenters.new" ] || { rm -f "$APP_DIR/presenters.new"; return 0; }
+        if ! cmp -s "$APP_DIR/presenters.new" "$APP_DIR/presenters.txt"; then
+            mv -f "$APP_DIR/presenters.new" "$APP_DIR/presenters.txt"
+            n=$(presenter_names | grep -c . || true)
+            log "The presenters list in Drive has $(plural "$n" name names)."
+        else
+            rm -f "$APP_DIR/presenters.new"
+        fi
+    elif printf '%s\n' "# Presenters: one name per line. The live uploader asks \"Who are you?\" with these names" \
+             "# when a live starts. The cloud keeps this file up to date. Lines starting # are left out." |
+         "$RCLONE" rcat "$DEST/$CHECKS_FOLDER/Presenters.txt" --contimeout 15s --timeout 30s >/dev/null 2>&1; then
+        log "Made \"$CHECKS_FOLDER/Presenters.txt\" in Drive, for the cloud to fill with the presenters' names."
+    fi
+}
+# The window: "Who are you?" and one big button per name. One click saves that name and closes it.
+# JavaScript for macOS (AppKit through osascript): no extra permissions. If it won't open, a plain list is used instead.
+WHO_WINDOW='ObjC.import("Cocoa");
+function run(argv) {
+  var app = $.NSApplication.sharedApplication, picked = "";
+  app.setActivationPolicy(1);   // no Dock icon
+  ObjC.registerSubclass({ name: "SalsabeelWho", protocols: ["NSWindowDelegate"], methods: {
+    "pick:": { types: ["void", ["id"]], implementation: function (b) { picked = ObjC.unwrap(b.title); app.stopModal; } },
+    "windowWillClose:": { types: ["void", ["id"]], implementation: function (n) { app.stopModal; } } } });
+  var who = $.SalsabeelWho.alloc.init, n = argv.length, cols = n > 8 ? 2 : 1, rows = Math.ceil(n / cols);
+  var bw = 240, bh = 48, gap = 10, top = 70, W = cols * bw + (cols + 1) * gap + 20, H = top + rows * (bh + gap) + 20;
+  var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, W, H), 1 | 2, 2, false);
+  win.title = "Salsabeel"; win.level = 3; win.releasedWhenClosed = false; win.delegate = who;
+  var label = $.NSTextField.labelWithString("Who are you?");
+  label.font = $.NSFont.boldSystemFontOfSize(24); label.frame = $.NSMakeRect(20, H - 52, W - 40, 34);
+  win.contentView.addSubview(label);
+  for (var i = 0; i < n; i++) {
+    var c = i % cols, r = Math.floor(i / cols);
+    var b = $.NSButton.buttonWithTitleTargetAction(argv[i], who, "pick:");
+    b.bezelStyle = 2; b.font = $.NSFont.systemFontOfSize(20);
+    b.frame = $.NSMakeRect(20 + gap / 2 + c * (bw + gap), H - top - (r + 1) * (bh + gap), bw, bh);
+    win.contentView.addSubview(b);
+  }
+  win.center; app.activateIgnoringOtherApps(true); win.makeKeyAndOrderFront(null);
+  app.runModalForWindow(win);
+  win.orderOut(null);
+  return picked;
+}'
+who_window() { osascript -l JavaScript -e "$WHO_WINDOW" "$@"; }
+who_list() {   # the plain list, if the window won't open (it needs an OK)
+    osascript -e 'on run argv' -e 'activate' \
+        -e 'set picked to choose from list argv with title "Salsabeel" with prompt "Who are you?" OK button name "That’s me" cancel button name "Skip"' \
+        -e 'if picked is false then return ""' -e 'return item 1 of picked' -e 'end run' "$@"
+}
+ask_window() {   # base names...: on this Mac's screen; the name clicked goes to base.names (none if closed or left)
+    local base=$1 pid t=0 st how=window n
+    shift
+    if [ -n "$ASK" ]; then "$ASK" "$@" > "$base.answer" 2>/dev/null & else who_window "$@" > "$base.answer" 2>/dev/null & fi
+    pid=$!
+    while :; do
+        while kill -0 "$pid" 2>/dev/null && [ "$t" -lt "$PRESENTERS_WAIT" ]; do sleep 1; t=$((t + 1)); done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$base.answer"
+            log "Nobody answered \"Who are you?\", so it closed by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes)."
+            return 0
+        fi
+        wait "$pid"; st=$?
+        if [ "$st" = 0 ] || [ "$how" = list ] || [ "$t" -gt 15 ]; then break; fi
+        log "The \"Who are you?\" window would not open (error $st), so it asks with a plain list instead."
+        how=list
+        if [ -n "${SALSABEEL_UPLOADER_ASK2:-}" ]; then "$SALSABEEL_UPLOADER_ASK2" "$@" > "$base.answer" 2>/dev/null &
+        else who_list "$@" > "$base.answer" 2>/dev/null & fi
+        pid=$!
+    done
+    tr -d '\r' < "$base.answer" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' > "$base.ticked" || true
+    rm -f "$base.answer"
+    n=$(grep -c . "$base.ticked" || true)
+    if [ "$n" -gt 0 ] && [ -f "$base.src" ]; then
+        mv -f "$base.ticked" "$base.names"
+        log "Who's on this live: $(paste -sd ',' "$base.names" | sed 's/,/, /g') (clicked)."
+    else
+        rm -f "$base.ticked"
+        log "\"Who are you?\" was closed without a name."
+    fi
+}
+ask_presenters() {   # a live has started (the file it records to): ask "Who are you?", once per recording
+    local s id n names=()
+    [ "$PRESENTERS_ASK" = on ] || return 0
+    for s in "$PRES"/*.src; do if [ "$(cat "$s")" = "$1" ]; then return 0; fi; done   # (asked already)
+    while IFS= read -r n; do names+=("$n"); done < <(presenter_names)
+    if [ "${#names[@]}" -eq 0 ]; then return 0; fi   # no names in Drive yet: nothing to ask
+    mkdir -p "$PRES"; id=$(date +%s)
+    while [ -e "$PRES/$id.src" ]; do id=$((id + 1)); done
+    printf '%s\n' "$1" > "$PRES/$id.src"
+    # In the background, in its own process group, so it never holds anything up and outlives this run
+    # (launchd ends whatever is left in a run's group when the run ends).
+    set -m
+    ask_window "$PRES/$id" "${names[@]}" </dev/null >/dev/null 2>&1 &
+    set +m
+    log "Asked \"Who are you?\" on this Mac's screen ($(plural "${#names[@]}" name names); it closes by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes))."
+}
+presenters_named() {   # recording-path new-path [short]: the answer belongs to this name in Drive
+    local s
+    for s in "$PRES"/*.src; do
+        case "$(cat "$s")" in "$1"|*/"$(basename "$1")") ;; *) continue ;; esac
+        if [ -n "${3:-}" ]; then rm -f "$s" "${s%.src}.name"   # a short recording is not a live: no answer goes up
+        else basename "$2" > "${s%.src}.name"; fi
+    done
+}
+presenters_renamed() {   # old new: a recording got " (2)" to avoid a clash in Drive
+    local s
+    for s in "$PRES"/*.name; do if [ "$(cat "$s")" = "$1" ]; then printf '%s\n' "$2" > "$s"; fi; done
+}
+send_presenters() {   # answers whose recording has its name: "<recording>.presenters.txt" next to it in Drive
+    local s b name t
+    t=$(date +%s)
+    for s in "$PRES"/*.names; do
+        b=${s%.names}
+        if [ ! -f "$b.src" ]; then rm -f "$s"; continue; fi
+        [ -s "$b.name" ] || continue
+        name=$(cat "$b.name")
+        if "$RCLONE" copyto "$s" "$DEST/$name.presenters.txt" --contimeout 15s --timeout 60s >/dev/null 2>&1; then
+            log "Sent who was on \"$(live_name "$name")\" to Drive ($(paste -sd ',' "$s" | sed 's/,/, /g'))."
+            rm -f "$b.src" "$b.name" "$s"
+        fi
+    done
+    for s in "$PRES"/*.src; do   # asked over a day ago and never answered: forget it
+        b=${s%.src}
+        if [ ! -f "$b.names" ] && [ $(( t - $(mtime "$s") )) -gt 86400 ]; then rm -f "$s" "$b.name"; fi
+    done
+}
 recording_now() {   # is a live on? LIVE Studio has a recording open, or a recording changed in the last 90 seconds
     local f t on=""
     on=$(live_studio_videos | head -n 1)
@@ -632,7 +782,10 @@ recording_now() {   # is a live on? LIVE Studio has a recording open, or a recor
         done < <(recordings; if [ -s "$FOLLOW" ]; then cat "$FOLLOW"; fi)
     fi
     if [ -n "$on" ]; then
-        if [ ! -f "$APP_DIR/live-on" ]; then echo "$on" > "$APP_DIR/live-on"; log "Live started (file \"$on\")."; fi
+        if [ ! -f "$APP_DIR/live-on" ]; then
+            echo "$on" > "$APP_DIR/live-on"; log "Live started (file \"$on\")."
+            ask_presenters "$on"
+        fi
         return 0
     fi
     if [ -f "$APP_DIR/live-on" ]; then
@@ -726,9 +879,15 @@ clear_copied() {   # lives the cloud has taken ("Copied - ..."): delete them her
        [ $(( t - $(mtime "$APP_DIR/cleared-checked") )) -lt "$CLEAR_EVERY" ]; then return 0; fi
     touch "$APP_DIR/cleared-checked"
     clear_parts
-    "$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 60s 2>/dev/null | grep '^Copied - ' > "$APP_DIR/copied" || return 0
+    "$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 60s > "$APP_DIR/drive-files" 2>/dev/null || return 0
+    grep '^Copied - ' "$APP_DIR/drive-files" > "$APP_DIR/copied" || return 0
     while IFS= read -r f; do
+        case "$f" in *.presenters.txt)   # who was on a live the cloud has taken (if it renamed it too)
+            "$RCLONE" deletefile "$DEST/$f" --drive-use-trash=false --contimeout 15s --timeout 60s >/dev/null 2>&1; continue ;; esac
         is_video "$f" || continue
+        if grep -qxF -- "${f#Copied - }.presenters.txt" "$APP_DIR/drive-files"; then   # its "who was on" too
+            "$RCLONE" deletefile "$DEST/${f#Copied - }.presenters.txt" --drive-use-trash=false --contimeout 15s --timeout 60s >/dev/null 2>&1 || true
+        fi
         if err=$("$RCLONE" deletefile "$DEST/$f" --drive-use-trash=false --contimeout 15s --timeout 60s 2>&1); then
             log "Deleted \"$f\" from this Google Drive: the cloud has its own copy."
             n=$((n + 1))
@@ -788,6 +947,7 @@ if [ -s "$FOLLOW" ]; then
 fi
 clear_copied   # first: it frees space for the Drive check below
 empty_bin
+read_presenters
 rescue_moved
 
 pending() { find "$READY" -type f ! -name '.*' 2>/dev/null; }
@@ -796,6 +956,7 @@ waiting=$(pending | grep -c . || true)
 echo "$waiting" > "$APP_DIR/waiting-count"
 if [ "$waiting" -eq 0 ]; then
     if recording_now; then NOW_LINE="A live is on: nothing waits to upload"; BUSY=1; fi
+    send_presenters
     status_if_due; exit 0
 fi
 LIVE=""
@@ -835,13 +996,14 @@ for f in "$READY"/*; do
     if taken "$base"; then
         stem="${base%.*}"; ext="${base##*.}"; n=2
         while taken "$stem ($n).$ext" || [ -e "$READY/$stem ($n).$ext" ]; do n=$((n + 1)); done
-        mv -n "$f" "$READY/$stem ($n).$ext" && base="$stem ($n).$ext"
+        mv -n "$f" "$READY/$stem ($n).$ext" && presenters_renamed "$base" "$stem ($n).$ext" && base="$stem ($n).$ext"
     fi
     existing="$existing
 $base"
 done
 waiting=$(pending | grep -c . || true)
 FILES_LABEL=$(label)
+send_presenters   # (after any renaming above)
 
 # Only what fits in Google Drive, oldest first, one at a time.
 free=""
@@ -964,6 +1126,7 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
         if [ -n "$UPDATED" ]; then   # ... but never by stopping an upload: that would start the file again from zero
             log "The new version takes over after this upload (the upload carries on)."
         fi
+        read_presenters; send_presenters
     fi
     if [ "$mode" = full ] && [ $(( now_s - full_t )) -ge "$LINE_SAMPLE_EVERY" ]; then   # a reading every 10 minutes
         line_sample $(( sent - full_b )) $(( now_s - full_t )); full_t=$now_s; full_b=$sent
