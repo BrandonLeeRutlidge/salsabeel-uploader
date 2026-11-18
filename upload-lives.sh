@@ -206,9 +206,9 @@ who_page() {   # names...: writes $APP_DIR/who.html from the status page's own l
     [ -f "$TEMPLATE" ] && grep -q 'class="brand"' "$TEMPLATE" || return 1
     WHO_COLS=1; WHO_W=460
     if [ $# -gt 4 ]; then WHO_COLS=2; WHO_W=600; fi
-    rows=$(( ($# + WHO_COLS - 1) / WHO_COLS )); WHO_H=$(( 270 + rows * 66 )); if [ "$WHO_H" -lt 380 ]; then WHO_H=380; fi
+    rows=$(( ($# + WHO_COLS - 1) / WHO_COLS )); WHO_H=$(( 295 + rows * 66 )); if [ "$WHO_H" -lt 380 ]; then WHO_H=380; fi
     {
-        printf '<!DOCTYPE html>\n<html lang="en-GB">\n<head>\n<meta charset="utf-8">\n<title>Salsabeel: who are you?</title>\n'
+        printf '<!DOCTYPE html>\n<html lang="en-GB">\n<head>\n<meta charset="utf-8">\n<title>Salsabeel: clock in</title>\n'
         sed -n '/<style>/,/<\/style>/p' "$TEMPLATE"
         cat <<CSS
 <style>
@@ -223,13 +223,14 @@ who_page() {   # names...: writes $APP_DIR/who.html from the status page's own l
   .picked #who { display: none; }
   .picked #thanks { display: block; }
   #thanks .msg { margin-bottom: 4px; }
+  .sub { font-size: 15px; color: var(--muted); margin: -4px 0 0; }
 </style>
 </head>
 <body>
   <div class="card">
 CSS
-        grep 'class="brand"' "$TEMPLATE" | sed 's#<span>[^<]*</span>#<span>CLOCK IN</span>#'
-        printf '    <div id="who">\n      <div class="state"><span class="dot"></span>Live now</div>\n      <h1>Who are you?</h1>\n      <div class="grid">\n'
+        grep 'class="brand"' "$TEMPLATE"   # the logo, and "LIVE UPLOADER" as on the status window
+        printf '    <div id="who">\n      <div class="state"><span class="dot"></span>Live now</div>\n      <h1>Clock in</h1>\n      <p class="sub">Tap your name.</p>\n      <div class="grid">\n'
         for name in "$@"; do printf '        <button class="tile">%s</button>\n' "$(html_esc "$name")"; done
         printf '      </div>\n    </div>\n'
         printf '    <div id="thanks" class="done">\n      <div class="state"><span class="dot"></span>Clocked in</div>\n'
@@ -303,7 +304,7 @@ who_window() {   # names...: the window (the page is made first; no page, no win
 }
 who_list() {   # the plain list, if the window won't open (it needs an OK)
     osascript -e 'on run argv' -e 'activate' \
-        -e 'set picked to choose from list argv with title "Salsabeel" with prompt "Who are you?" OK button name "That’s me" cancel button name "Skip"' \
+        -e 'set picked to choose from list argv with title "Salsabeel" with prompt "Clock in: tap your name" OK button name "That’s me" cancel button name "Skip"' \
         -e 'if picked is false then return ""' -e 'return item 1 of picked' -e 'end run' "$@"
 }
 thanks_note() {   # name: the plain list's thank-you (the window shows its own); never more than 8 seconds

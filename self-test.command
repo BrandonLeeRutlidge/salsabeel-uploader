@@ -825,8 +825,8 @@ unset SALSABEEL_UPLOADER_THANKS
 # The window's page: the status page's look, a tile per name (a pretend osascript: no window opens here)
 mkdir -p "$ROOT/who-bin"; printf '#!/bin/bash\nprintf "%%s\\n" "$@" > "%s"\n' "$ROOT/osa-args" > "$ROOT/who-bin/osascript"; chmod +x "$ROOT/who-bin/osascript"
 PATH="$ROOT/who-bin:$PATH" bash "$ROOT/app/upload-lives.sh" --who Alice 'B<e>a' Cara Dana Evie
-check "the window's page: the uploader's look (logo, CLOCK IN), a tile per name (names made safe), and 2 columns for 5 names" \
-      'W="$ROOT/app/who.html"; [ "$(grep -c "class=\"tile\"" "$W")" = 5 ] && grep -q "data:image/png;base64" "$W" && grep -q "<span>CLOCK IN</span>" "$W" &&
+check "the window's page: the uploader's look (logo, LIVE UPLOADER), \"Clock in\", a tile per name (names made safe), and 2 columns for 5 names" \
+      'W="$ROOT/app/who.html"; [ "$(grep -c "class=\"tile\"" "$W")" = 5 ] && grep -q "data:image/png;base64" "$W" && grep -q "<span>LIVE UPLOADER</span>" "$W" && grep -q "<h1>Clock in</h1>" "$W" && grep -q "Tap your name." "$W" &&
        grep -q "B&lt;e&gt;a" "$W" && grep -q "repeat(2, 1fr)" "$W" && grep -q "Thanks for clocking in" "$W" && sed -n 1p "$ROOT/osa-args" | grep -qx -- -l &&
        grep -qx "$ROOT/app/who.html" "$ROOT/osa-args" && grep -qx 600 "$ROOT/osa-args"'
 unset SALSABEEL_UPLOADER_ASK; rm -rf "$ROOT/app/presenters" "$ROOT/app/presenters.txt"; setup "$DRIVE"
