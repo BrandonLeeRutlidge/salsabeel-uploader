@@ -79,10 +79,14 @@ SLEEP_GAP_SECONDS=600          # no run for this long: the Mac was asleep (or of
 PARTS_UPLOAD=off               # on: a live goes up in parts (Parts/<name>/part-0001...), so a stop costs one part at most.
 PART_MB=250                    #   part size at full speed ...
 PART_LIVE_MB=100               #   ... and during a live
+PARTS_TPS=2                    #   Drive calls a second while sending a part, at most
+PARTS_CHUNK=32M                #   the piece size within a part (fewer calls than rclone's 8M)
 PARTS_MIN_MB=300               #   smaller recordings go up whole
 LINE_SAMPLE_MIN_MB=50          # a line-speed reading needs at least this much sent at full speed ...
 LINE_SAMPLE_MIN_SECONDS=60     # ... over at least this long
 LINE_SAMPLE_EVERY=600          # and one every 10 minutes at full speed, so a long upload cut short still gives one
+RATE_WAIT_MIN=5                # Google Drive says "slow down" (rate limit): wait this many minutes before trying again,
+RATE_WAIT_MAX=60               #   twice as long each time in a row, up to this; a good upload resets it
 CLEAR_EVERY=120                # how often it looks for lives the cloud has taken (every minute while Drive is full)
 PING_HOSTS="${SALSABEEL_UPLOADER_PING_HOSTS:-1.1.1.1 8.8.8.8}"
 PING="${SALSABEEL_UPLOADER_PING:-ping}"
@@ -191,6 +195,7 @@ status_uploading() {   # percent "done / total" eta
 status_done() { write_status done "Done" "The live is in Google Drive" "All done. You can turn the Mac off now." 100 "Uploaded at $(date '+%H:%M')" "Done · Salsabeel"; }
 status_paused() { write_status retry "Paused for the live" "Upload paused while you are live" "A live is on, so the upload waits and carries on by itself once the recording stops. Leave the Mac on." "${pct:-0}" "Carries on after the live" "Paused · Salsabeel"; }
 status_full() { write_status retry "Google Drive is full" "Waiting for space in Google Drive" "The Google Drive is full right now. The live is safe on this Mac and uploads by itself once there is space. You can turn the Mac off." "${pct:-0}" "Tries again every minute" "Drive full · Salsabeel"; }
+status_slowdown() { write_status retry "Google Drive said slow down" "Waiting a few minutes" "Google Drive asked this Mac to slow down for a while. Nothing is wrong with the internet or the live: it tries again by itself at $1. Leave the Mac on." "${pct:-0}" "Next try at $1" "Slowing down · Salsabeel"; }
 status_retry() { write_status retry "Not uploaded yet" "Waiting for the internet" "Google Drive could not be reached. It tries again by itself every minute, so leave the Mac on and online." "${1:-0}" "Next try in about a minute" "Waiting · Salsabeel"; }
 
 # --- "Who are you?" window ----------------------------------------------------------------------------
@@ -1116,6 +1121,15 @@ if [ -z "$LIVE" ] && { [ "$finished" -gt 0 ] || [ "$(cat "$APP_DIR/page-opened-b
     open_page
 fi
 
+# Google Drive asked to slow down (a rate limit): no upload until the wait is over, so it is not made worse
+if [ -f "$APP_DIR/rate-wait" ]; then
+    read -r rw_until rw_mins < "$APP_DIR/rate-wait" 2>/dev/null
+    if [ "${rw_until:-0}" -gt "$(date +%s)" ] 2>/dev/null; then
+        NOW_LINE="Google Drive asked to slow down: the next try is at $(clock_of "$rw_until" %H:%M)"
+        status_slowdown "$(clock_of "$rw_until" %H:%M)"
+        status_if_due; exit 0
+    fi
+fi
 # Never overwrite a recording already in Google Drive: a clash gets " (2)", " (3)" and so on.
 existing=$("$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 30s 2>/dev/null) ||
     { "$RCLONE" mkdir "$DEST" --contimeout 15s --timeout 30s >/dev/null 2>&1 &&
@@ -1191,8 +1205,10 @@ start_upload() {   # the next rclone: the whole file, or the next part; sets rcl
         bytes=$(( count * 1048576 )); if [ $(( FSIZE - POFF )) -lt "$bytes" ]; then bytes=$(( FSIZE - POFF )); fi
         PPART=$(printf 'part-%04d' $(( PNUM + 1 ))); PBYTES=$bytes
         PMD5=$(dd if="$SRC" bs=1048576 skip=$(( POFF / 1048576 )) count="$count" 2>/dev/null | md5_stdin)
+        # Fewer Drive calls per part: at most PARTS_TPS a second, and bigger pieces (Drive's "rateLimitExceeded", 18 Nov)
         dd if="$SRC" bs=1048576 skip=$(( POFF / 1048576 )) count="$count" 2>/dev/null |
-            "$RCLONE" rcat "$PDIR/$PPART" --size "$bytes" --low-level-retries 20 "${common[@]}" &
+            "$RCLONE" rcat "$PDIR/$PPART" --size "$bytes" --low-level-retries 20 --tpslimit "$PARTS_TPS" --tpslimit-burst 1 \
+                --drive-chunk-size "$PARTS_CHUNK" "${common[@]}" &
     else
         "$RCLONE" move "$READY" "$DEST" --files-from "$APP_DIR/to-upload" --transfers 1 --retries 3 --low-level-retries 20 \
             "${common[@]}" &
@@ -1388,6 +1404,7 @@ if [ -n "$paused" ]; then
     now_live "$left"
 elif [ -n "$ok" ]; then
     log "Uploaded to $DEST"
+    rm -f "$APP_DIR/rate-wait"   # Drive is happy again
     if [ -n "$PARTS" ]; then total=$FSIZE; fi
     if [ "$mode" = full ]; then line_sample $(( total - full_b )) $(( $(date +%s) - full_t )); fi   # the line's speed
     status_done
@@ -1396,11 +1413,24 @@ elif [ -n "$ok" ]; then
     if [ "$mode" = live ] && [ "$left" -gt 0 ]; then NOW_LINE="A live is on: $(plural "$left" "upload waits" "uploads wait"), the next goes slowly in a minute"
     elif [ "$left" -gt 0 ]; then NOW_LINE="Uploaded one: $(plural "$left" "live waits" "lives wait"), the next starts within a minute"; fi
 else
-    grep -vE ' / .*[0-9]+%' "$PROGRESS" | tail -n 5 >> "$LOG"
+    { grep -m 2 -E 'ERROR|googleapi|Failed to' "$PROGRESS" | cut -c1-300   # the head of rclone's error (what failed, and why) ...
+      grep -vE ' / .*[0-9]+%' "$PROGRESS" | tail -n 5; } >> "$LOG"           # ... and its end
     if grep -qiE 'storageQuotaExceeded|quota has been exceeded|quotaExceeded' "$PROGRESS"; then
         log "Google Drive is full: it stays in \"Ready to upload\" and is tried again in a minute."
         status_full
         now_full "$left"
+    elif grep -qiE 'rateLimitExceeded|userRateLimitExceeded|rate limit exceeded|Error 429|too many requests' "$PROGRESS"; then
+        # Not the internet: Google Drive wants fewer requests for a while. Wait, twice as long each time in a row.
+        rw_mins=$RATE_WAIT_MIN
+        if [ -f "$APP_DIR/rate-wait" ]; then
+            read -r rw_until rw_mins < "$APP_DIR/rate-wait" 2>/dev/null
+            rw_mins=$(( ${rw_mins:-$RATE_WAIT_MIN} * 2 )); if [ "$rw_mins" -gt "$RATE_WAIT_MAX" ]; then rw_mins=$RATE_WAIT_MAX; fi
+        fi
+        rw_until=$(( $(date +%s) + rw_mins * 60 ))
+        echo "$rw_until $rw_mins" > "$APP_DIR/rate-wait"
+        log "Google Drive asked to slow down (rate limit), so it waits $(plural "$rw_mins" minute minutes) before trying again (what is in Drive is kept)."
+        status_slowdown "$(clock_of "$rw_until" %H:%M)"
+        NOW_LINE="Google Drive asked to slow down: the next try is at $(clock_of "$rw_until" %H:%M)"
     else
         log "Upload failed; it stays in \"Ready to upload\" and is tried again in a minute."
         status_retry "${pct:-0}"

@@ -831,6 +831,37 @@ check "the window's page: the uploader's look (logo, LIVE UPLOADER), \"Clock in\
        grep -qx "$ROOT/app/who.html" "$ROOT/osa-args" && grep -qx 600 "$ROOT/osa-args"'
 unset SALSABEEL_UPLOADER_ASK; rm -rf "$ROOT/app/presenters" "$ROOT/app/presenters.txt"; setup "$DRIVE"
 
+# Google Drive says "slow down" (403 rateLimitExceeded): it waits, longer each time, and never says "no internet"
+cat > "$ROOT/ratelimit-rclone" <<EOF
+#!/bin/bash
+if [ "\$1" = move ] || [ "\$1" = rcat ]; then
+    echo "\$1" >> "$ROOT/rl-calls"
+    if [ -e "$ROOT/rl-on" ]; then
+        prev=""; for a in "\$@"; do if [ "\$prev" = --log-file ]; then lf=\$a; fi; prev=\$a; done
+        echo "2026/11/18 22:07:27 ERROR : Salsabeel live.mp4: Failed to copy: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded" >> "\$lf"
+        exit 1
+    fi
+fi
+exec "$RCLONE" "\$@"
+EOF
+chmod +x "$ROOT/ratelimit-rclone"; touch "$ROOT/rl-on"; rm -f "$ROOT/rl-calls" "$ROOT/app/rate-wait"
+head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-13 16-24.mp4"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\n' "$REC" "$DRIVE" "$ROOT/ratelimit-rclone" > "$ROOT/app/config.sh"
+: > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+check "Drive says rateLimitExceeded: the log keeps the error's head, it waits 5 minutes, says \"asked to slow down\" (not \"Waiting for the internet\")" \
+      'grep -q "googleapi: Error 403: User rate limit exceeded" "$ROOT/test.log" && grep -q "Google Drive asked to slow down (rate limit), so it waits 5 minutes" "$ROOT/test.log" && [ "$(cut -d" " -f2 "$ROOT/app/rate-wait")" = 5 ] &&
+       grep -qE "^Now: +Google Drive asked to slow down: the next try is at [0-9]{2}:[0-9]{2}$" "$NOTE" && ! grep -q "Waiting for the internet" "$NOTE"'
+calls=$(grep -c . "$ROOT/rl-calls"); bash "$ROOT/app/upload-lives.sh"
+check "while it waits, the next minute's run sends nothing to Drive" '[ "$(grep -c . "$ROOT/rl-calls")" = "$calls" ] && [ -e "$REC/Ready to upload/Salsabeel live 2026-11-13 16-24.mp4" ]'
+echo "$(( $(date +%s) - 1 )) 5" > "$ROOT/app/rate-wait"; bash "$ROOT/app/upload-lives.sh"
+check "slowed down again straight after: it waits twice as long (10 minutes)" '[ "$(cut -d" " -f2 "$ROOT/app/rate-wait")" = 10 ]'
+echo "$(( $(date +%s) - 1 )) 40" > "$ROOT/app/rate-wait"; bash "$ROOT/app/upload-lives.sh"
+check "the wait never goes past an hour" '[ "$(cut -d" " -f2 "$ROOT/app/rate-wait")" = 60 ]'
+rm -f "$ROOT/rl-on"; echo "$(( $(date +%s) - 1 )) 60" > "$ROOT/app/rate-wait"; bash "$ROOT/app/upload-lives.sh"
+check "once the wait is over it uploads, and a good upload clears the wait" \
+      '[ ! -e "$REC/Ready to upload/Salsabeel live 2026-11-13 16-24.mp4" ] && [ ! -e "$ROOT/app/rate-wait" ]'
+setup "$DRIVE"
+
 if [ -f manifest.txt ]; then
     check "manifest.txt matches these files (run streaming-mac/build.sh after a change)" \
           '( for n in upload-lives.sh status-page.html; do grep -qx "$(sha "$n")  $n" manifest.txt || exit 1; done )'
