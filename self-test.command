@@ -794,11 +794,41 @@ check "no answer: no presenters file in Drive (the website tap-in covers it)" 'g
 rm -f "$ROOT/app/presenters/"*; printf '#!/bin/bash\nexit 1\n' > "$ROOT/no-window"; chmod +x "$ROOT/no-window"
 printf '#!/bin/bash\necho "$3"\n' > "$ROOT/fake-list"; chmod +x "$ROOT/fake-list"
 start_live; : > "$ROOT/test.log"
+printf '#!/bin/bash\necho "$1" >> "%s"\n' "$ROOT/thanked" > "$ROOT/fake-thanks"; chmod +x "$ROOT/fake-thanks"; rm -f "$ROOT/thanked"
+export SALSABEEL_UPLOADER_THANKS="$ROOT/fake-thanks"
 SALSABEEL_UPLOADER_ASK="$ROOT/no-window" SALSABEEL_UPLOADER_ASK2="$ROOT/fake-list" bash "$ROOT/app/upload-lives.sh"
-for i in $(seq 1 10); do ls "$ROOT/app/presenters/"*.names >/dev/null 2>&1 && break; sleep 1; done
-check "the window won't open: it asks with a plain list instead" \
-      'grep -q "would not open (error 1)" "$ROOT/test.log" && [ "$(cat "$ROOT/app/presenters/"*.names)" = Cara ]'
+for i in $(seq 1 10); do [ -s "$ROOT/thanked" ] && break; sleep 1; done
+check "the window won't open: it asks with a plain list instead, then says thanks to that name" \
+      'grep -q "would not open (error 1)" "$ROOT/test.log" && [ "$(cat "$ROOT/app/presenters/"*.names)" = Cara ] && [ "$(cat "$ROOT/thanked")" = Cara ]'
 stop_live; ago "$REC/on_air.mp4" 10; bash "$ROOT/app/upload-lives.sh"
+# The window's thank-you goes wrong after the click: the name is kept, and the list never comes back
+rm -rf "$ROOT/app/presenters"; rm -f "$ROOT/thanked" "$ROOT/listed"
+printf '#!/bin/bash\necho "$2"\nexit 1\n' > "$ROOT/thanks-fails"; chmod +x "$ROOT/thanks-fails"
+printf '#!/bin/bash\necho listed >> "%s"\necho "$1"\n' "$ROOT/listed" > "$ROOT/count-list"; chmod +x "$ROOT/count-list"
+start_live; : > "$ROOT/test.log"
+SALSABEEL_UPLOADER_ASK="$ROOT/thanks-fails" SALSABEEL_UPLOADER_ASK2="$ROOT/count-list" bash "$ROOT/app/upload-lives.sh"
+for i in $(seq 1 10); do grep -q "(clicked)" "$ROOT/test.log" && break; sleep 1; done; sleep 2
+check "the thank-you fails after the click: the name is kept, and no second ask" \
+      '[ "$(cat "$ROOT/app/presenters/"*.names)" = Bea ] && [ ! -e "$ROOT/listed" ] && ! grep -q "would not open" "$ROOT/test.log"'
+stop_live; ago "$REC/on_air.mp4" 10; bash "$ROOT/app/upload-lives.sh"
+rm -rf "$ROOT/app/presenters"
+printf '#!/bin/bash\necho "$3"\necho $$ > "%s"\nsleep 60\n' "$ROOT/hang-pid" > "$ROOT/thanks-hangs"; chmod +x "$ROOT/thanks-hangs"
+start_live; : > "$ROOT/test.log"
+SALSABEEL_UPLOADER_ASK="$ROOT/thanks-hangs" SALSABEEL_UPLOADER_ASK2="$ROOT/count-list" SALSABEEL_UPLOADER_THANKS_MAX=3 bash "$ROOT/app/upload-lives.sh"
+for i in $(seq 1 5); do grep -q "(clicked)" "$ROOT/test.log" && break; sleep 1; done
+saved_fast=$(cat "$ROOT/app/presenters/"*.names 2>/dev/null)
+sleep 5
+check "the thank-you hangs: the name is saved at once, the window is shut soon after, and no second ask" \
+      '[ "$saved_fast" = Cara ] && ! kill -0 "$(cat "$ROOT/hang-pid")" 2>/dev/null && [ ! -e "$ROOT/listed" ] && ! grep -q "Nobody answered" "$ROOT/test.log"'
+stop_live; ago "$REC/on_air.mp4" 10; bash "$ROOT/app/upload-lives.sh"
+unset SALSABEEL_UPLOADER_THANKS
+# The window's page: the status page's look, a tile per name (a pretend osascript: no window opens here)
+mkdir -p "$ROOT/who-bin"; printf '#!/bin/bash\nprintf "%%s\\n" "$@" > "%s"\n' "$ROOT/osa-args" > "$ROOT/who-bin/osascript"; chmod +x "$ROOT/who-bin/osascript"
+PATH="$ROOT/who-bin:$PATH" bash "$ROOT/app/upload-lives.sh" --who Alice 'B<e>a' Cara Dana Evie
+check "the window's page: the uploader's look (logo, CLOCK IN), a tile per name (names made safe), and 2 columns for 5 names" \
+      'W="$ROOT/app/who.html"; [ "$(grep -c "class=\"tile\"" "$W")" = 5 ] && grep -q "data:image/png;base64" "$W" && grep -q "<span>CLOCK IN</span>" "$W" &&
+       grep -q "B&lt;e&gt;a" "$W" && grep -q "repeat(2, 1fr)" "$W" && grep -q "Thanks for clocking in" "$W" && sed -n 1p "$ROOT/osa-args" | grep -qx -- -l &&
+       grep -qx "$ROOT/app/who.html" "$ROOT/osa-args" && grep -qx 600 "$ROOT/osa-args"'
 unset SALSABEEL_UPLOADER_ASK; rm -rf "$ROOT/app/presenters" "$ROOT/app/presenters.txt"; setup "$DRIVE"
 
 if [ -f manifest.txt ]; then

@@ -193,6 +193,139 @@ status_paused() { write_status retry "Paused for the live" "Upload paused while 
 status_full() { write_status retry "Google Drive is full" "Waiting for space in Google Drive" "The Google Drive is full right now. The live is safe on this Mac and uploads by itself once there is space. You can turn the Mac off." "${pct:-0}" "Tries again every minute" "Drive full · Salsabeel"; }
 status_retry() { write_status retry "Not uploaded yet" "Waiting for the internet" "Google Drive could not be reached. It tries again by itself every minute, so leave the Mac on and online." "${1:-0}" "Next try in about a minute" "Waiting · Salsabeel"; }
 
+# --- "Who are you?" window ----------------------------------------------------------------------------
+# The same look as the status page (its styles and logo): "Who are you?" with a big tile per name. One click
+# saves that name, then the page says "Thanks for clocking in, <name>! Enjoy your shift." for 3 seconds and the
+# window closes. It is a web page in a window (JavaScript for macOS, WebKit): no extra permissions. A click sets the
+# page's title to "picked:<name>", which the window's own loop reads; the name is written out before anything else.
+# If the page won't open, a plain list is used instead. (SALSABEEL_WHO_TEST_PICK clicks a name by itself: a check.)
+html_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+WHO_COLS=1; WHO_W=460; WHO_H=300
+who_page() {   # names...: writes $APP_DIR/who.html from the status page's own look; sets WHO_W and WHO_H
+    local f="$APP_DIR/who.html" name rows
+    [ -f "$TEMPLATE" ] && grep -q 'class="brand"' "$TEMPLATE" || return 1
+    WHO_COLS=1; WHO_W=460
+    if [ $# -gt 4 ]; then WHO_COLS=2; WHO_W=600; fi
+    rows=$(( ($# + WHO_COLS - 1) / WHO_COLS )); WHO_H=$(( 270 + rows * 66 )); if [ "$WHO_H" -lt 380 ]; then WHO_H=380; fi
+    {
+        printf '<!DOCTYPE html>\n<html lang="en-GB">\n<head>\n<meta charset="utf-8">\n<title>Salsabeel: who are you?</title>\n'
+        sed -n '/<style>/,/<\/style>/p' "$TEMPLATE"
+        cat <<CSS
+<style>
+  body { padding: 20px; user-select: none; -webkit-user-select: none; cursor: default; }
+  .card { max-width: none; }
+  .grid { display: grid; grid-template-columns: repeat($WHO_COLS, 1fr); gap: 10px; margin-top: 18px; }
+  .tile { font: inherit; font-size: 20px; font-weight: 600; color: var(--text); background: #232327;
+    border: 1px solid var(--line); border-radius: 14px; padding: 15px 10px; cursor: pointer; }
+  .tile:hover { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255,45,111,.25), 0 0 18px rgba(255,45,111,.35); }
+  .tile:active { background: rgba(255,45,111,.18); }
+  #thanks { display: none; }
+  .picked #who { display: none; }
+  .picked #thanks { display: block; }
+  #thanks .msg { margin-bottom: 4px; }
+</style>
+</head>
+<body>
+  <div class="card">
+CSS
+        grep 'class="brand"' "$TEMPLATE" | sed 's#<span>[^<]*</span>#<span>CLOCK IN</span>#'
+        printf '    <div id="who">\n      <div class="state"><span class="dot"></span>Live now</div>\n      <h1>Who are you?</h1>\n      <div class="grid">\n'
+        for name in "$@"; do printf '        <button class="tile">%s</button>\n' "$(html_esc "$name")"; done
+        printf '      </div>\n    </div>\n'
+        printf '    <div id="thanks" class="done">\n      <div class="state"><span class="dot"></span>Clocked in</div>\n'
+        printf '      <h1>Thanks for clocking in, <span id="name"></span>!</h1>\n      <p class="msg">Enjoy your shift.</p>\n    </div>\n'
+        printf '  </div>\n<script>\n'
+        printf '  var done = false;\n'
+        printf '  function pick(n) { if (done) return; done = true; document.getElementById("name").textContent = n;\n'
+        printf '    document.body.classList.add("picked"); document.title = "picked:" + n; }\n'
+        printf '  document.querySelectorAll(".tile").forEach(function (b) { b.addEventListener("click", function () { pick(b.textContent); }); });\n'
+        if [ -n "${SALSABEEL_WHO_TEST_PICK:-}" ]; then
+            printf '  setTimeout(function () { document.querySelectorAll(".tile").forEach(function (b) { if (b.textContent === "%s") b.click(); }); }, 2500);\n' "$(html_esc "$SALSABEEL_WHO_TEST_PICK")"
+        fi
+        printf '</script>\n</body>\n</html>\n'
+    } > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+WHO_WINDOW='ObjC.import("Cocoa"); ObjC.import("WebKit");
+function run(argv) {
+  var page = argv[0], W = Number(argv[1]), H = Number(argv[2]);
+  var app = $.NSApplication.sharedApplication, picked = "", closed = false, shown = 0, snapped = {};
+  var testSnap = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey("SALSABEEL_WHO_TEST_SNAP")) || "";
+  app.setActivationPolicy(1);   // no Dock icon
+  app.finishLaunching;
+  ObjC.registerSubclass({ name: "SalsabeelWho", protocols: ["NSWindowDelegate"], methods: {
+    "windowWillClose:": { types: ["void", ["id"]], implementation: function (n) { closed = true; } } } });
+  function pump(seconds) {   // answer the window for up to this long (no beachball)
+    var ev = app.nextEventMatchingMaskUntilDateInModeDequeue($.NSEventMaskAny, $.NSDate.dateWithTimeIntervalSinceNow(seconds), $.NSDefaultRunLoopMode, true);
+    if (ev && !ev.isNil()) app.sendEvent(ev);
+  }
+  var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, W, H), 1 | 2, 2, false);
+  win.title = "Salsabeel"; win.level = 3; win.releasedWhenClosed = false; win.delegate = $.SalsabeelWho.alloc.init;
+  win.backgroundColor = $.NSColor.colorWithSRGBRedGreenBlueAlpha(14 / 255, 14 / 255, 16 / 255, 1);
+  var wv = $.WKWebView.alloc.initWithFrameConfiguration($.NSMakeRect(0, 0, W, H), $.WKWebViewConfiguration.alloc.init);
+  win.contentView = wv;
+  var url = $.NSURL.fileURLWithPath(page);
+  wv.loadFileURLAllowingReadAccessToURL(url, url.URLByDeletingLastPathComponent);
+  function title() { var t = wv.title; return (t && !t.isNil()) ? ObjC.unwrap(t) : ""; }
+  function snap(name) {   // (a check on a Mac: a picture of the window)
+    if (!testSnap || snapped[name]) return;
+    snapped[name] = true;
+    try {
+      wv.takeSnapshotWithConfigurationCompletionHandler($(), function (img, err) {
+        try { $.NSBitmapImageRep.imageRepWithData(img.TIFFRepresentation).representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({})).writeToFileAtomically(testSnap + "/" + name + ".png", true); } catch (e) {}
+      });
+    } catch (e) { $(String(e)).writeToFileAtomicallyEncodingError(testSnap + "/" + name + ".err", true, 4, $()); }
+  }
+  var t0 = Date.now();
+  while (!picked && !closed && Date.now() - t0 < 900000) {   // the shell closes it sooner (10 minutes)
+    pump(0.1);
+    var t = title();
+    if (!shown && t.indexOf("Salsabeel") === 0) { win.center; app.activateIgnoringOtherApps(true); win.makeKeyAndOrderFront(null); shown = Date.now(); }
+    if (!shown && Date.now() - t0 > 10000) throw new Error("the page did not open");
+    if (shown && Date.now() - shown > 1500) snap("1-who");
+    if (t.indexOf("picked:") === 0) picked = t.slice(7);
+  }
+  if (picked) {
+    $.NSFileHandle.fileHandleWithStandardOutput.writeData($(picked + "\n").dataUsingEncoding(4));   // the name, first
+    try {
+      var end = Date.now() + 3000;
+      while (Date.now() < end && !closed) {   // the thank-you, for a fixed 3 seconds, still answering
+        pump(0.1);
+        if (Date.now() > end - 2000) snap("2-thanks");
+      }
+    } catch (e) {}
+  }
+  win.orderOut(null);
+  return "";
+}'
+who_window() {   # names...: the window (the page is made first; no page, no window: the plain list is used)
+    who_page "$@" || return 1
+    osascript -l JavaScript -e "$WHO_WINDOW" "$APP_DIR/who.html" "$WHO_W" "$WHO_H"
+}
+who_list() {   # the plain list, if the window won't open (it needs an OK)
+    osascript -e 'on run argv' -e 'activate' \
+        -e 'set picked to choose from list argv with title "Salsabeel" with prompt "Who are you?" OK button name "That’s me" cancel button name "Skip"' \
+        -e 'if picked is false then return ""' -e 'return item 1 of picked' -e 'end run' "$@"
+}
+thanks_note() {   # name: the plain list's thank-you (the window shows its own); never more than 8 seconds
+    local p i=0
+    if [ -n "${SALSABEEL_UPLOADER_THANKS:-}" ]; then
+        "$SALSABEEL_UPLOADER_THANKS" "$1" >/dev/null 2>&1 &
+    else
+        osascript -e 'on run argv' -e 'try' -e 'activate' \
+            -e 'display dialog ("Thanks for clocking in, " & item 1 of argv & "!" & return & "Enjoy your shift.") with title "Salsabeel" buttons {"OK"} default button 1 giving up after 3' \
+            -e 'end try' -e 'end run' "$1" >/dev/null 2>&1 &
+    fi
+    p=$!
+    while kill -0 "$p" 2>/dev/null && [ "$i" -lt 8 ]; do sleep 1; i=$((i + 1)); done
+    kill "$p" 2>/dev/null; wait "$p" 2>/dev/null
+}
+if [ "${1:-}" = "--who" ]; then   # the window on its own (a check): --who name name ...; prints the name clicked
+    shift
+    TEMPLATE="${SALSABEEL_UPLOADER_TEMPLATE:-$(dirname "$0")/status-page.html}"
+    who_window "$@"
+    exit $?
+fi
+
 if [ "${1:-}" = "--preview" ]; then   # what the page looks like mid-upload
     TEMPLATE="${SALSABEEL_UPLOADER_TEMPLATE:-$(dirname "$0")/status-page.html}"
     PAGE="${TMPDIR:-/tmp}/Salsabeel live uploader (preview).html"
@@ -678,69 +811,49 @@ read_presenters() {   # the names list from Drive (every PRESENTERS_EVERY). The 
         log "Made \"$CHECKS_FOLDER/Presenters.txt\" in Drive, for the cloud to fill with the presenters' names."
     fi
 }
-# The window: "Who are you?" and one big button per name. One click saves that name and closes it.
-# JavaScript for macOS (AppKit through osascript): no extra permissions. If it won't open, a plain list is used instead.
-WHO_WINDOW='ObjC.import("Cocoa");
-function run(argv) {
-  var app = $.NSApplication.sharedApplication, picked = "";
-  app.setActivationPolicy(1);   // no Dock icon
-  ObjC.registerSubclass({ name: "SalsabeelWho", protocols: ["NSWindowDelegate"], methods: {
-    "pick:": { types: ["void", ["id"]], implementation: function (b) { picked = ObjC.unwrap(b.title); app.stopModal; } },
-    "windowWillClose:": { types: ["void", ["id"]], implementation: function (n) { app.stopModal; } } } });
-  var who = $.SalsabeelWho.alloc.init, n = argv.length, cols = n > 8 ? 2 : 1, rows = Math.ceil(n / cols);
-  var bw = 240, bh = 48, gap = 10, top = 70, W = cols * bw + (cols + 1) * gap + 20, H = top + rows * (bh + gap) + 20;
-  var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, W, H), 1 | 2, 2, false);
-  win.title = "Salsabeel"; win.level = 3; win.releasedWhenClosed = false; win.delegate = who;
-  var label = $.NSTextField.labelWithString("Who are you?");
-  label.font = $.NSFont.boldSystemFontOfSize(24); label.frame = $.NSMakeRect(20, H - 52, W - 40, 34);
-  win.contentView.addSubview(label);
-  for (var i = 0; i < n; i++) {
-    var c = i % cols, r = Math.floor(i / cols);
-    var b = $.NSButton.buttonWithTitleTargetAction(argv[i], who, "pick:");
-    b.bezelStyle = 2; b.font = $.NSFont.systemFontOfSize(20);
-    b.frame = $.NSMakeRect(20 + gap / 2 + c * (bw + gap), H - top - (r + 1) * (bh + gap), bw, bh);
-    win.contentView.addSubview(b);
-  }
-  win.center; app.activateIgnoringOtherApps(true); win.makeKeyAndOrderFront(null);
-  app.runModalForWindow(win);
-  win.orderOut(null);
-  return picked;
-}'
-who_window() { osascript -l JavaScript -e "$WHO_WINDOW" "$@"; }
-who_list() {   # the plain list, if the window won't open (it needs an OK)
-    osascript -e 'on run argv' -e 'activate' \
-        -e 'set picked to choose from list argv with title "Salsabeel" with prompt "Who are you?" OK button name "That’s me" cancel button name "Skip"' \
-        -e 'if picked is false then return ""' -e 'return item 1 of picked' -e 'end run' "$@"
+got_name() {   # base: a name has come back? Saved at once (kept even if the window then fails or hangs)
+    local base=$1 n
+    [ -s "$base.answer" ] || return 1
+    tr -d '\r' < "$base.answer" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' | awk '!s[$0]++' > "$base.ticked"
+    n=$(grep -c . "$base.ticked" || true)
+    if [ "$n" -eq 0 ]; then rm -f "$base.ticked"; return 1; fi
+    if [ -f "$base.src" ]; then
+        mv -f "$base.ticked" "$base.names"
+        touch "$APP_DIR/status-due"   # the note says who it is within a minute
+        log "Who's on this live: $(paste -sd ',' "$base.names" | sed 's/,/, /g') (clicked)."
+    else
+        rm -f "$base.ticked"
+    fi
+    return 0
 }
+THANKS_MAX="${SALSABEEL_UPLOADER_THANKS_MAX:-15}"   # once a name is in, the window gets this long to say thanks and close
 ask_window() {   # base names...: on this Mac's screen; the name clicked goes to base.names (none if closed or left)
-    local base=$1 pid t=0 st how=window n
+    local base=$1 pid t=0 st=0 how=window saved="" limit
     shift
     if [ -n "$ASK" ]; then "$ASK" "$@" > "$base.answer" 2>/dev/null & else who_window "$@" > "$base.answer" 2>/dev/null & fi
     pid=$!
     while :; do
-        while kill -0 "$pid" 2>/dev/null && [ "$t" -lt "$PRESENTERS_WAIT" ]; do sleep 1; t=$((t + 1)); done
-        if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$base.answer"
-            log "Nobody answered \"Who are you?\", so it closed by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes)."
-            return 0
-        fi
-        wait "$pid"; st=$?
-        if [ "$st" = 0 ] || [ "$how" = list ] || [ "$t" -gt 15 ]; then break; fi
+        limit=$PRESENTERS_WAIT
+        while kill -0 "$pid" 2>/dev/null && [ "$t" -lt "$limit" ]; do
+            sleep 1; t=$((t + 1))
+            if [ -z "$saved" ] && got_name "$base"; then saved=1; limit=$(( t + THANKS_MAX )); fi
+        done
+        if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; st=timeout
+        else wait "$pid"; st=$?; fi
+        if [ -z "$saved" ] && got_name "$base"; then saved=1; fi
+        if [ -n "$saved" ] || [ "$st" = 0 ] || [ "$st" = timeout ] || [ "$how" = list ] || [ "$t" -gt 15 ]; then break; fi
         log "The \"Who are you?\" window would not open (error $st), so it asks with a plain list instead."
         how=list
         if [ -n "${SALSABEEL_UPLOADER_ASK2:-}" ]; then "$SALSABEEL_UPLOADER_ASK2" "$@" > "$base.answer" 2>/dev/null &
         else who_list "$@" > "$base.answer" 2>/dev/null & fi
         pid=$!
     done
-    tr -d '\r' < "$base.answer" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' > "$base.ticked" || true
     rm -f "$base.answer"
-    n=$(grep -c . "$base.ticked" || true)
-    if [ "$n" -gt 0 ] && [ -f "$base.src" ]; then
-        mv -f "$base.ticked" "$base.names"
-        touch "$APP_DIR/status-due"   # the note says who it is within a minute
-        log "Who's on this live: $(paste -sd ',' "$base.names" | sed 's/,/, /g') (clicked)."
+    if [ -n "$saved" ]; then
+        if [ "$how" = list ] && [ -f "$base.names" ]; then thanks_note "$(head -n 1 "$base.names")"; fi
+    elif [ "$st" = timeout ]; then
+        log "Nobody answered \"Who are you?\", so it closed by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes)."
     else
-        rm -f "$base.ticked"
         log "\"Who are you?\" was closed without a name."
     fi
 }
