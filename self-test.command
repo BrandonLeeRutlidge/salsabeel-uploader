@@ -589,9 +589,9 @@ check "after the stall, the same upload carries on and finishes" \
       '! kill -0 "$up" 2>/dev/null && [ ! -e "$REC/Ready to upload/Salsabeel live 2026-11-12 16-02.mp4" ]'
 rm -f "$ROOT/app/last-sleep"; setup "$DRIVE"
 
-# Uploading in parts (PARTS_UPLOAD=on, the default from 18 Nov): Parts/<name>/part-0001 ..., the manifest last
+# Uploading in parts (PARTS_UPLOAD=on; off by default): Parts/<name>/part-0001 ..., the manifest last
 md5of() { if command -v md5 >/dev/null 2>&1; then md5 -q "$1"; else md5sum "$1" | cut -d' ' -f1; fi; }
-check "recordings under PARTS_MIN_MB (300 MB) still go up whole" '[ ! -d "$DRIVE/Parts" ]'
+check "parts are off by default: lives go up whole" '[ ! -d "$DRIVE/Parts" ]'
 P1="Salsabeel live 2026-11-13 10-02.mp4"; PD1="$DRIVE/Parts/$P1"
 head -c 3670016 /dev/urandom > "$REC/Ready to upload/$P1"; want=$(md5of "$REC/Ready to upload/$P1")
 setup "$DRIVE" 'PARTS_UPLOAD=on
