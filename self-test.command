@@ -745,6 +745,56 @@ check "the morning: the first upload starts within seconds of waking, after the 
 check "the morning: it keeps the Mac awake while it uploads (caffeinate)" 'grep -qE "^-ims -w [0-9]+$" "$ROOT/caffeinated"'
 setup "$DRIVE"
 
+# "Who are you?" at the start of a live: names from "Uploader checks/Presenters.txt" in Drive, the answer next to the live
+# (pretend names here: real ones live only in Drive)
+CHK="$DRIVE/Uploader checks"; mkdir -p "$CHK"; rm -f "$CHK/Presenters.txt" "$ROOT/app/presenters.txt" "$ROOT/app/presenters-checked"
+setup "$DRIVE"; : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+check "no names list in Drive: it makes \"Presenters.txt\" (no names in it) for the cloud to fill" \
+      '[ -f "$CHK/Presenters.txt" ] && ! grep -v "^#" "$CHK/Presenters.txt" | grep -q . && grep -q "Made \"Uploader checks/Presenters.txt\"" "$ROOT/test.log"'
+cat > "$ROOT/fake-ask" <<EOF
+#!/bin/bash
+# A pretend "Who are you?" window: notes what it was shown, and clicks the second name
+echo "\$*" >> "$ROOT/asked"
+if [ -n "\${ASK_SLOW:-}" ]; then echo \$\$ > "$ROOT/ask-pid"; sleep 60; fi
+echo "\$2"
+EOF
+chmod +x "$ROOT/fake-ask"; rm -f "$ROOT/asked"
+export SALSABEEL_UPLOADER_ASK="$ROOT/fake-ask"
+start_live; ago "$ROOT/app/presenters-checked" 20; bash "$ROOT/app/upload-lives.sh"
+check "a live starts with no names in the list: nothing is asked" '[ ! -e "$ROOT/asked" ]'
+stop_live; rm -f "$REC/on_air.mp4"; bash "$ROOT/app/upload-lives.sh"
+printf '# Presenters\r\nAlice\r\n Bea \r\n\r\nCara\r\n' > "$CHK/Presenters.txt"; ago "$ROOT/app/presenters-checked" 20
+start_live; : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+for i in $(seq 1 10); do ls "$ROOT/app/presenters/"*.names >/dev/null 2>&1 && break; sleep 1; done
+bash "$ROOT/app/upload-lives.sh"
+check "a live starts: \"Who are you?\" shows the names from Drive, once" \
+      '[ "$(cat "$ROOT/asked")" = "Alice Bea Cara" ] && grep -q "Asked \"Who are you?\"" "$ROOT/test.log"'
+check "the answer is kept on the Mac until the recording has its name" \
+      '[ "$(cat "$ROOT/app/presenters/"*.names)" = Bea ] && grep -q "on this live: Bea (clicked)" "$ROOT/test.log"'
+stop_live; ago "$REC/on_air.mp4" 10; : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+VID=$(cd "$DRIVE" && ls Salsabeel\ live\ *.mp4 2>/dev/null | while IFS= read -r v; do [ -f "$v.presenters.txt" ] && echo "$v"; done | head -n 1)
+check "once the live has stopped: \"<recording>.presenters.txt\" goes next to it in Drive, with the name clicked" \
+      '[ -n "$VID" ] && [ "$(cat "$DRIVE/$VID.presenters.txt")" = Bea ] && [ -z "$(ls "$ROOT/app/presenters/")" ]'
+if [ -n "$VID" ]; then mv "$DRIVE/$VID" "$DRIVE/Copied - $VID"; fi; rm -f "$ROOT/app/cleared-checked"; bash "$ROOT/app/upload-lives.sh"
+check "the cloud takes the live (\"Copied - …\"): its presenters file is deleted with it" \
+      '[ -n "$VID" ] && [ ! -e "$DRIVE/Copied - $VID" ] && [ ! -e "$DRIVE/$VID.presenters.txt" ]'
+rm -f "$ROOT/asked"; start_live; : > "$ROOT/test.log"
+ASK_SLOW=1 SALSABEEL_UPLOADER_ASK_WAIT=3 bash "$ROOT/app/upload-lives.sh"
+for i in $(seq 1 15); do grep -q "closed by itself" "$ROOT/test.log" && break; sleep 1; done
+check "nobody answers: it closes by itself (the list is shut), and nothing is saved" \
+      'grep -q "Nobody answered" "$ROOT/test.log" && ! kill -0 "$(cat "$ROOT/ask-pid")" 2>/dev/null && ! ls "$ROOT/app/presenters/"*.names >/dev/null 2>&1'
+stop_live; ago "$REC/on_air.mp4" 10; bash "$ROOT/app/upload-lives.sh"
+check "no answer: no presenters file in Drive (the website tap-in covers it)" 'grep -q "  Uploaded to" "$ROOT/test.log" && [ "$(count "$DRIVE" "*.presenters.txt")" = 0 ]'
+rm -f "$ROOT/app/presenters/"*; printf '#!/bin/bash\nexit 1\n' > "$ROOT/no-window"; chmod +x "$ROOT/no-window"
+printf '#!/bin/bash\necho "$3"\n' > "$ROOT/fake-list"; chmod +x "$ROOT/fake-list"
+start_live; : > "$ROOT/test.log"
+SALSABEEL_UPLOADER_ASK="$ROOT/no-window" SALSABEEL_UPLOADER_ASK2="$ROOT/fake-list" bash "$ROOT/app/upload-lives.sh"
+for i in $(seq 1 10); do ls "$ROOT/app/presenters/"*.names >/dev/null 2>&1 && break; sleep 1; done
+check "the window won't open: it asks with a plain list instead" \
+      'grep -q "would not open (error 1)" "$ROOT/test.log" && [ "$(cat "$ROOT/app/presenters/"*.names)" = Cara ]'
+stop_live; ago "$REC/on_air.mp4" 10; bash "$ROOT/app/upload-lives.sh"
+unset SALSABEEL_UPLOADER_ASK; rm -rf "$ROOT/app/presenters" "$ROOT/app/presenters.txt"; setup "$DRIVE"
+
 if [ -f manifest.txt ]; then
     check "manifest.txt matches these files (run streaming-mac/build.sh after a change)" \
           '( for n in upload-lives.sh status-page.html; do grep -qx "$(sha "$n")  $n" manifest.txt || exit 1; done )'
