@@ -926,6 +926,20 @@ check "then it waits 5 minutes before trying again (not every minute)" \
       '[ "$(cut -d" " -f2 "$ROOT/app/rate-wait")" = 5 ] && grep -q "Google Drive kept refusing the upload, so it waits 5 minutes" "$ROOT/test.log"'
 rm -f "$ROOT/app/rate-wait" "$REC/Ready to upload/Salsabeel live 2026-11-15 19-09.mp4"; setup "$DRIVE"
 
+# Parts left from an unfinished upload (parts now off): deleted once that live went up whole, and nothing else
+PP="$DRIVE/Parts"; rm -rf "$PP"; mkdir -p "$PP/Salsabeel live 2026-11-13 16-24.mp4" "$PP/Salsabeel live 2026-11-16 10-00.mp4" "$PP/Salsabeel live 2026-11-16 11-00.mp4" "$PP/holiday"
+head -c 10 /dev/zero > "$PP/Salsabeel live 2026-11-13 16-24.mp4/part-0001"; head -c 10 /dev/zero > "$PP/Salsabeel live 2026-11-13 16-24.mp4/part-0002"
+head -c 10 /dev/zero > "$PP/Salsabeel live 2026-11-16 10-00.mp4/part-0001"; echo "clipline-parts 1" > "$PP/Salsabeel live 2026-11-16 10-00.mp4/manifest.txt"
+head -c 10 /dev/zero > "$PP/Salsabeel live 2026-11-16 11-00.mp4/part-0001"; head -c 10 /dev/zero > "$PP/holiday/part-0001"
+head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-16 11-00.mp4"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\nLIVE_UPLOAD=off\n' "$REC" "$DRIVE" "$RCLONE" > "$ROOT/app/config.sh"
+touch "$ROOT/app/paused"; start_live; rm -f "$ROOT/app/cleared-checked"; : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+check "parts off: an unfinished parts folder is deleted once its live has gone up whole, and logged" \
+      '[ ! -e "$PP/Salsabeel live 2026-11-13 16-24.mp4" ] && grep -q "Deleted the unfinished parts of \"Salsabeel live 2026-11-13 16-24.mp4\" from Google Drive (2 files)" "$ROOT/test.log"'
+check "parts off: a finished one (manifest), one whose live still waits here, and a non-live folder are all kept" \
+      '[ -e "$PP/Salsabeel live 2026-11-16 10-00.mp4/manifest.txt" ] && [ -e "$PP/Salsabeel live 2026-11-16 11-00.mp4/part-0001" ] && [ -e "$PP/holiday/part-0001" ]'
+stop_live; rm -f "$REC/on_air.mp4" "$ROOT/app/paused" "$REC/Ready to upload/Salsabeel live 2026-11-16 11-00.mp4"; rm -rf "$PP"; setup "$DRIVE"
+
 if [ -f manifest.txt ]; then
     check "manifest.txt matches these files (run streaming-mac/build.sh after a change)" \
           '( for n in upload-lives.sh status-page.html; do grep -qx "$(sha "$n")  $n" manifest.txt || exit 1; done )'

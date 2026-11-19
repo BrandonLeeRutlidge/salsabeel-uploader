@@ -1022,7 +1022,23 @@ parts_finish() {   # all parts are in: the manifest goes up last, and the record
 }
 clear_parts() {   # the cloud has joined a recording ("Parts/Copied - <name>"): delete that folder, and the copy here
     local d n
-    "$RCLONE" lsf "$DEST/Parts" --dirs-only --contimeout 15s --timeout 60s 2>/dev/null | grep '^Copied - ' > "$APP_DIR/copied-parts" || return 0
+    "$RCLONE" lsf "$DEST/Parts" --dirs-only --contimeout 15s --timeout 60s > "$APP_DIR/parts-dirs" 2>/dev/null || return 0
+    # Parts left from an upload that was never finished (parts were switched off, 18 Nov): once that live is no longer
+    # waiting here (it went up whole), its unfinished parts only fill Google Drive. No manifest = never finished.
+    if [ "$PARTS_UPLOAD" != on ]; then
+        while IFS= read -r d; do
+            n=${d%/}
+            case "$n" in "$PREFIX "*) ;; *) continue ;; esac   # only lives this app sent (by name)
+            if [ -e "$READY/$n" ] || [ -e "$WATCH_DIR/.sent/$n" ]; then continue; fi
+            "$RCLONE" lsf "$DEST/Parts/$n" --files-only --contimeout 15s --timeout 60s 2>/dev/null > "$APP_DIR/parts-files" || continue
+            if grep -qx 'manifest.txt' "$APP_DIR/parts-files"; then continue; fi
+            if "$RCLONE" purge "$DEST/Parts/$n" --drive-use-trash=false --contimeout 15s --timeout 60s >/dev/null 2>&1; then
+                rm -f "$APP_DIR/parts/$(printf '%s' "$n" | tr -c 'A-Za-z0-9._-' '_')"*
+                log "Deleted the unfinished parts of \"$n\" from Google Drive ($(grep -c . "$APP_DIR/parts-files") files): parts are off, and the live itself went up whole."
+            fi
+        done < "$APP_DIR/parts-dirs"
+    fi
+    grep '^Copied - ' "$APP_DIR/parts-dirs" > "$APP_DIR/copied-parts" || return 0
     while IFS= read -r d; do
         n=${d%/}
         case "$n" in "Copied - $PREFIX "*) ;; *) continue ;; esac   # only lives this app sent (by name)
