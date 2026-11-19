@@ -1287,6 +1287,7 @@ status_pid=""
 status_tried=0
 checked=$(date +%s); good_since=$checked; bad=0; last_tick=$checked
 ok=""
+resent=""; err_logged=""; tot_first=""
 while :; do   # once for a whole file; once per part when sending in parts
 while kill -0 "$rclone_pid" 2>/dev/null; do
     ticks=$((ticks + 1))
@@ -1379,12 +1380,27 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
             fi
         fi
     fi
+    if [ -z "$err_logged" ] && grep -qE 'ERROR|googleapi' "$PROGRESS" 2>/dev/null; then   # seen as it happens, not hours later
+        err_logged=1; log "rclone says (it keeps trying): $(grep -m 1 -E 'ERROR|googleapi' "$PROGRESS" | cut -c1-300)"
+    fi
     line=$(grep -E ' / .*[0-9]+%' "$PROGRESS" 2>/dev/null | tail -n 1)
     if [ -z "$held" ] && [ -n "$line" ]; then
         pct=$(printf '%s' "$line" | grep -oE '[0-9]+%' | tail -n 1 | tr -d '%')
         sizes=$(printf '%s' "$line" | sed -nE 's#.* ([0-9.]+ [KMGTP]?i?B) / ([0-9.]+ [KMGTP]?i?B),.*#\1 / \2#p')
         eta=$(printf '%s' "$line" | sed -nE 's/.*ETA ([^ ]+).*/\1/p')
         if [ -n "$sizes" ]; then sent=$(to_bytes "${sizes% / *}"); fi
+        # rclone starts a refused file again from zero (up to 20 times), and adds each try to its total: once the total
+        # has grown past 1.5 times what it first said, it's going round in circles (19 Nov: 105 GB for a 5 GB live).
+        # Stop, and let the wait below take over.
+        if [ -n "$sizes" ] && [ -z "$PARTS" ] && [ -z "$resent" ]; then
+            tot_now=$(to_bytes "${sizes#* / }")
+            if [ -z "$tot_first" ]; then tot_first=$tot_now
+            elif [ "$tot_now" -gt $(( tot_first * 3 / 2 )) ]; then
+                resent=1
+                log "Google Drive keeps refusing the end of this upload and rclone keeps starting it again ($(human_size "${sizes#* / }") sent for a $(( total / 1048576 )) MB file), so it stops here."
+                stop_upload
+            fi
+        fi
         if [ -n "$PARTS" ] && [ -n "$sizes" ]; then   # the whole recording, not just this part
             sent=$(( POFF + sent )); pct=$(( sent * 100 / FSIZE )); sizes="$(gib "$sent") / $(gib "$FSIZE")"
             rate=$(printf '%s' "$line" | sed -nE 's#.*, ([0-9.]+ [KMGT]?i?B)/s,.*#\1#p')
@@ -1411,7 +1427,7 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
     fi
     sleep 2
 done
-if ! wait "$rclone_pid"; then break; fi
+if ! wait "$rclone_pid" || [ -n "$resent" ]; then break; fi
 if [ -z "$PARTS" ]; then ok=1; break; fi
 if ! part_landed; then log "$PPART of \"$PNAME\" did not check out in Drive; it goes again next time."; break; fi
 printf 'part %s %s %s %s\n' "$PPART" "$POFF" "$PBYTES" "$PMD5" >> "$PSTATE"
@@ -1446,7 +1462,7 @@ else
         log "Google Drive is full: it stays in \"Ready to upload\" and is tried again in a minute."
         status_full
         now_full "$left"
-    elif grep -qiE 'rateLimitExceeded|userRateLimitExceeded|rate limit exceeded|Error 429|too many requests' "$PROGRESS"; then
+    elif [ -n "$resent" ] || grep -qiE 'rateLimitExceeded|userRateLimitExceeded|rate limit exceeded|Error 429|too many requests' "$PROGRESS"; then
         # Not the internet: Google Drive wants fewer requests for a while. Wait, twice as long each time in a row.
         rw_mins=$RATE_WAIT_MIN
         if [ -f "$APP_DIR/rate-wait" ]; then
@@ -1455,7 +1471,8 @@ else
         fi
         rw_until=$(( $(date +%s) + rw_mins * 60 ))
         echo "$rw_until $rw_mins" > "$APP_DIR/rate-wait"
-        log "Google Drive asked to slow down (rate limit), so it waits $(plural "$rw_mins" minute minutes) before trying again (what is in Drive is kept)."
+        if [ -n "$resent" ]; then why="Google Drive kept refusing the upload"; else why="Google Drive asked to slow down (rate limit)"; fi
+        log "$why, so it waits $(plural "$rw_mins" minute minutes) before trying again (what is in Drive is kept)."
         status_slowdown "$(clock_of "$rw_until" %H:%M)"
         NOW_LINE="Google Drive asked to slow down: the next try is at $(clock_of "$rw_until" %H:%M)"
     else
