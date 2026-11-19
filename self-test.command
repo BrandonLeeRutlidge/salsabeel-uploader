@@ -900,6 +900,32 @@ ago "$ROOT/app/fixer-hold" 31; bash "$ROOT/app/upload-lives.sh"
 check "a hold left over (over 30 minutes old) is ignored, so uploads never stop for good" '[ ! -e "$REC/Ready to upload/Salsabeel live 2026-11-15 10-00.mp4" ]'
 rm -f "$ROOT/app/fixer-hold"
 
+# Drive refuses the end of a file and rclone starts it again and again: stopped at 1.5 times the file, with the reason
+cat > "$ROOT/resend-rclone" <<EOF
+#!/bin/bash
+trap ':' USR2   # (real rclone takes this as "full speed")
+if [ "\$1" = move ]; then
+    prev=""; for a in "\$@"; do if [ "\$prev" = --log-file ]; then lf=\$a; fi; prev=\$a; done
+    echo "2026/11/19 05:14:02 ERROR : Salsabeel live.mp4: Failed to copy: googleapi: Error 500: Internal Error, backendError" >> "\$lf"
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        echo "2026/11/19 05:14:0\$i NOTICE: Transferred:   	  \$(( i * 300 )) MiB / \$(( i * 300 + 100 )) MiB, 75%, 50 MiB/s, ETA 2s" >> "\$lf"; sleep 1
+    done
+    exit 0
+fi
+exec "$RCLONE" "\$@"
+EOF
+chmod +x "$ROOT/resend-rclone"; rm -f "$ROOT/app/rate-wait"
+head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-15 19-09.mp4"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\n' "$REC" "$DRIVE" "$ROOT/resend-rclone" > "$ROOT/app/config.sh"
+: > "$ROOT/test.log"; t0=$(date +%s); bash "$ROOT/app/upload-lives.sh"; took=$(( $(date +%s) - t0 ))
+check "a file sent again and again: stopped once rclone's total grows past 1.5 times what it first said ($took s), not after hours, and it says why" \
+      'grep -q "keeps refusing the end of this upload and rclone keeps starting it again" "$ROOT/test.log" && [ "$took" -lt 10 ] &&
+       [ -e "$REC/Ready to upload/Salsabeel live 2026-11-15 19-09.mp4" ]'
+check "rclone's first error shows in the log while it's still trying (Error 500 …)" 'grep -q "rclone says (it keeps trying): .*googleapi: Error 500" "$ROOT/test.log"'
+check "then it waits 5 minutes before trying again (not every minute)" \
+      '[ "$(cut -d" " -f2 "$ROOT/app/rate-wait")" = 5 ] && grep -q "Google Drive kept refusing the upload, so it waits 5 minutes" "$ROOT/test.log"'
+rm -f "$ROOT/app/rate-wait" "$REC/Ready to upload/Salsabeel live 2026-11-15 19-09.mp4"; setup "$DRIVE"
+
 if [ -f manifest.txt ]; then
     check "manifest.txt matches these files (run streaming-mac/build.sh after a change)" \
           '( for n in upload-lives.sh status-page.html; do grep -qx "$(sha "$n")  $n" manifest.txt || exit 1; done )'
