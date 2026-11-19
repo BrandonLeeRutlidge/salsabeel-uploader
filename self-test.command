@@ -534,8 +534,12 @@ EOF
 chmod +x "$ROOT/bin-rclone"
 printf '[testdrive]\ntype = alias\nremote = %s\n' "$ROOT/Google Drive" > "$ROOT/rclone.conf"
 printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\n' "$REC" "testdrive:Salsabeel lives" "$ROOT/bin-rclone" > "$ROOT/app/config.sh"
+mkdir -p "$BIN/Other folder"; head -c 4096 /dev/zero > "$BIN/Other folder/Salsabeel live 2026-11-01 18-00.mp4"
+head -c 4096 /dev/zero > "$BIN/Salsabeel live 2026-11-05 18-00.mp4"   # look-alikes outside the lives folder
 : > "$ROOT/test.log"; rm -f "$ROOT/app/bin-checked"
 RCLONE_CONFIG="$ROOT/rclone.conf" bash "$ROOT/app/upload-lives.sh"
+check "the bin: look-alike live names outside the lives folder are never touched (full Drive access is safe)" \
+      '[ -e "$BIN/Other folder/Salsabeel live 2026-11-01 18-00.mp4" ] && [ -e "$BIN/Salsabeel live 2026-11-05 18-00.mp4" ]'
 check "the bin: this app's live recordings in it are deleted for good, and logged with their size" \
       '[ ! -e "$BIN/Salsabeel lives/Salsabeel live 2026-11-01 18-00.mp4" ] && [ ! -e "$BIN/Salsabeel lives/Copied - Salsabeel live 2026-11-02 18-00.mp4" ] &&
        grep -q "Emptied from the Google Drive bin for good: \"Salsabeel lives/Salsabeel live 2026-11-01 18-00.mp4\" (2 MB)" "$ROOT/test.log"'
@@ -861,6 +865,40 @@ rm -f "$ROOT/rl-on"; echo "$(( $(date +%s) - 1 )) 60" > "$ROOT/app/rate-wait"; b
 check "once the wait is over it uploads, and a good upload clears the wait" \
       '[ ! -e "$REC/Ready to upload/Salsabeel live 2026-11-13 16-24.mp4" ] && [ ! -e "$ROOT/app/rate-wait" ]'
 setup "$DRIVE"
+
+# Full Drive access is safe: the cleanups only ever touch live names inside the lives folder
+OUT="$ROOT/Google Drive/Other folder"; mkdir -p "$OUT/Parts/Copied - Salsabeel live 2026-11-01 10-00.mp4"
+head -c 4096 /dev/zero > "$OUT/Copied - Salsabeel live 2026-11-01 10-00.mp4"
+head -c 4096 /dev/zero > "$DRIVE/Copied - holiday.mp4"
+mkdir -p "$DRIVE/Parts/Copied - holiday"; head -c 10 /dev/zero > "$DRIVE/Parts/Copied - holiday/part-0001"
+head -c 4096 /dev/zero > "$DRIVE/Copied - Salsabeel live 2026-11-02 10-00.mp4"
+setup "$DRIVE"; rm -f "$ROOT/app/cleared-checked"; bash "$ROOT/app/upload-lives.sh"
+check "cleanups: a taken live is deleted, but never a non-live \"Copied - …\" file or folder, nor anything outside the lives folder" \
+      '[ ! -e "$DRIVE/Copied - Salsabeel live 2026-11-02 10-00.mp4" ] && [ -e "$DRIVE/Copied - holiday.mp4" ] && [ -e "$DRIVE/Parts/Copied - holiday/part-0001" ] &&
+       [ -e "$OUT/Copied - Salsabeel live 2026-11-01 10-00.mp4" ] && [ -d "$OUT/Parts/Copied - Salsabeel live 2026-11-01 10-00.mp4" ]'
+rm -rf "$OUT" "$DRIVE/Copied - holiday.mp4" "$DRIVE/Parts/Copied - holiday"
+
+# Our own Google app: the cloud fills "Mac Google app.txt"; the Mac keeps a private copy for the fixer
+GA="$DRIVE/Uploader checks/Mac Google app.txt"; rm -f "$GA" "$ROOT/app/google-app" "$HOME/.salsabeel-uploader/google-app"
+ago "$ROOT/app/presenters-checked" 20; : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+check "Google app: the Mac makes an empty \"Mac Google app.txt\" in Drive for the cloud to fill, and changes nothing yet" \
+      '[ -f "$GA" ] && ! grep -q "^client_" "$GA" && [ ! -e "$ROOT/app/google-app" ]'
+printf '# Mac Google app\r\nclient_id=123-abc.apps.googleusercontent.com\r\n' > "$GA"; ago "$ROOT/app/presenters-checked" 20; bash "$ROOT/app/upload-lives.sh"
+check "Google app: half filled in (no secret yet): nothing is kept" '[ ! -e "$ROOT/app/google-app" ]'
+printf '# Mac Google app\r\nclient_id=123-abc.apps.googleusercontent.com\r\nclient_secret=GOCSPX-test\r\n' > "$GA"; ago "$ROOT/app/presenters-checked" 20; bash "$ROOT/app/upload-lives.sh"
+check "Google app: filled in: kept on the Mac (private to this user) and in the backup copy, and the log says to run the fixer" \
+      '[ "$(cat "$ROOT/app/google-app")" = "$(printf "client_id=123-abc.apps.googleusercontent.com\nclient_secret=GOCSPX-test")" ] &&
+       [ "$(stat -c %a "$ROOT/app/google-app" 2>/dev/null || stat -f %Lp "$ROOT/app/google-app")" = 600 ] &&
+       cmp -s "$ROOT/app/google-app" "$HOME/.salsabeel-uploader/google-app" && grep -q "Running \"Fix Salsabeel uploader\" once switches" "$ROOT/test.log"'
+rm -f "$GA" "$ROOT/app/google-app" "$HOME/.salsabeel-uploader/google-app"
+
+# "Fix Salsabeel uploader" switching the sign-in: no upload starts meanwhile (at most 30 minutes)
+setup "$DRIVE"; head -c 4096 /dev/zero > "$REC/Ready to upload/Salsabeel live 2026-11-15 10-00.mp4"
+touch "$ROOT/app/fixer-hold"; bash "$ROOT/app/upload-lives.sh"
+check "while the fixer switches the sign-in, nothing uploads" '[ -e "$REC/Ready to upload/Salsabeel live 2026-11-15 10-00.mp4" ]'
+ago "$ROOT/app/fixer-hold" 31; bash "$ROOT/app/upload-lives.sh"
+check "a hold left over (over 30 minutes old) is ignored, so uploads never stop for good" '[ ! -e "$REC/Ready to upload/Salsabeel live 2026-11-15 10-00.mp4" ]'
+rm -f "$ROOT/app/fixer-hold"
 
 if [ -f manifest.txt ]; then
     check "manifest.txt matches these files (run streaming-mac/build.sh after a change)" \

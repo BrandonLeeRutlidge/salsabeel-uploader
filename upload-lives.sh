@@ -115,7 +115,7 @@ touch "$APP_DIR/last-run"     # "Fix Salsabeel uploader" reads this to see that 
 
 # Put back anything of its own that has gone missing (moved or deleted), from the backup copy.
 RESTORED=""
-for f in config.sh status-page.html VERSION self-test.command show-log.command uninstall.command; do
+for f in config.sh status-page.html VERSION self-test.command show-log.command uninstall.command google-app; do
     if [ ! -f "$APP_DIR/$f" ] && [ -f "$BACKUP/$f" ] && cp -p "$BACKUP/$f" "$APP_DIR/$f"; then RESTORED="$RESTORED $f"; fi
 done
 if [ ! -x "$APP_DIR/bin/rclone" ] && [ -x "$BACKUP/bin/rclone" ] && mkdir -p "$APP_DIR/bin" &&
@@ -542,7 +542,7 @@ backup_self() {   # keep the hidden copy up to date (only what changed is copied
     local f conf
     mkdir -p "$BACKUP/bin" 2>/dev/null || return 0
     chmod 700 "$BACKUP" 2>/dev/null
-    for f in upload-lives.sh status-page.html config.sh VERSION self-test.command show-log.command uninstall.command; do
+    for f in upload-lives.sh status-page.html config.sh VERSION self-test.command show-log.command uninstall.command google-app; do
         if [ -f "$APP_DIR/$f" ] && ! cmp -s "$APP_DIR/$f" "$BACKUP/$f"; then cp -p "$APP_DIR/$f" "$BACKUP/$f"; fi
     done
     if [ -x "$APP_DIR/bin/rclone" ] && { [ ! -x "$BACKUP/bin/rclone" ] || [ "$APP_DIR/bin/rclone" -nt "$BACKUP/bin/rclone" ]; }; then
@@ -717,6 +717,8 @@ PIDFILE="$APP_DIR/running.pid"
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then exit 0; fi
 echo $$ > "$PIDFILE"
 trap 'rm -f "$PIDFILE"' EXIT
+# "Fix Salsabeel uploader" is switching the Google sign-in: start nothing until it's done (at most 30 minutes)
+if [ -f "$APP_DIR/fixer-hold" ] && [ $(( $(date +%s) - $(mtime "$APP_DIR/fixer-hold") )) -lt 1800 ]; then exit 0; fi
 
 update_if_due
 
@@ -801,6 +803,7 @@ read_presenters() {   # the names list from Drive (every PRESENTERS_EVERY). The 
     if [ -f "$APP_DIR/presenters-checked" ] && [ $(( t - $(mtime "$APP_DIR/presenters-checked") )) -lt "$PRESENTERS_EVERY" ]; then return 0; fi
     touch "$APP_DIR/presenters-checked"
     list=$("$RCLONE" lsf "$DEST/$CHECKS_FOLDER" --files-only --contimeout 15s --timeout 30s 2>/dev/null) || return 0
+    read_google_app "$list"
     if printf '%s\n' "$list" | grep -qxF 'Presenters.txt'; then
         "$RCLONE" cat "$DEST/$CHECKS_FOLDER/Presenters.txt" --contimeout 15s --timeout 30s > "$APP_DIR/presenters.new" 2>/dev/null &&
             [ -s "$APP_DIR/presenters.new" ] || { rm -f "$APP_DIR/presenters.new"; return 0; }
@@ -861,6 +864,27 @@ ask_window() {   # base names...: on this Mac's screen; the name clicked goes to
         log "Nobody answered \"Who are you?\", so it closed by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes)."
     else
         log "\"Who are you?\" was closed without a name."
+    fi
+}
+# Our own Google app for rclone (no more sharing rclone's built-in one). The cloud fills "Mac Google app.txt" in Drive
+# with its ID and secret; the Mac keeps a copy (readable only by this user) for "Fix Salsabeel uploader", which
+# makes the switch (it needs a Google sign-in). Nothing changes on this Mac until the file has both lines.
+GOOGLE_APP_FILE="Mac Google app.txt"
+read_google_app() {   # the "Uploader checks" listing
+    local f="$APP_DIR/google-app"
+    if printf '%s\n' "$1" | grep -qxF "$GOOGLE_APP_FILE"; then
+        ( umask 077; "$RCLONE" cat "$DEST/$CHECKS_FOLDER/$GOOGLE_APP_FILE" --contimeout 15s --timeout 30s 2>/dev/null |
+              tr -d '\r' | grep -E '^client_(id|secret)=[^[:space:]]+$' > "$f.new" ) || true
+        if [ "$(grep -c . "$f.new" 2>/dev/null)" = 2 ] && ! cmp -s "$f.new" "$f"; then
+            mv -f "$f.new" "$f"; chmod 600 "$f"
+            if [ -d "$BACKUP" ]; then cp -p "$f" "$BACKUP/google-app" 2>/dev/null; fi
+            log "Our own Google app is ready (from Drive). Running \"Fix Salsabeel uploader\" once switches the sign-in to it."
+        else
+            rm -f "$f.new"
+        fi
+    elif printf '%s\n' "# Mac Google app: the cloud fills in client_id= and client_secret= here. Keep it private." |
+         "$RCLONE" rcat "$DEST/$CHECKS_FOLDER/$GOOGLE_APP_FILE" --contimeout 15s --timeout 30s >/dev/null 2>&1; then
+        log "Made \"$CHECKS_FOLDER/$GOOGLE_APP_FILE\" in Drive, for the cloud to fill in."
     fi
 }
 ask_presenters() {   # a live has started (the file it records to): ask "Who are you?", once per recording
@@ -1001,6 +1025,7 @@ clear_parts() {   # the cloud has joined a recording ("Parts/Copied - <name>"): 
     "$RCLONE" lsf "$DEST/Parts" --dirs-only --contimeout 15s --timeout 60s 2>/dev/null | grep '^Copied - ' > "$APP_DIR/copied-parts" || return 0
     while IFS= read -r d; do
         n=${d%/}
+        case "$n" in "Copied - $PREFIX "*) ;; *) continue ;; esac   # only lives this app sent (by name)
         if "$RCLONE" purge "$DEST/Parts/$n" --drive-use-trash=false --contimeout 15s --timeout 60s >/dev/null 2>&1; then
             rm -f "$WATCH_DIR/.sent/${n#Copied - }" "$APP_DIR/parts/$(printf '%s' "${n#Copied - }" | tr -c 'A-Za-z0-9._-' '_')"*
             log "The cloud has joined \"${n#Copied - }\": its parts folder and the copy here are deleted."
@@ -1019,6 +1044,7 @@ clear_copied() {   # lives the cloud has taken ("Copied - ..."): delete them her
     "$RCLONE" lsf "$DEST" --files-only --contimeout 15s --timeout 60s > "$APP_DIR/drive-files" 2>/dev/null || return 0
     grep '^Copied - ' "$APP_DIR/drive-files" > "$APP_DIR/copied" || return 0
     while IFS= read -r f; do
+        case "$f" in "Copied - $PREFIX "*) ;; *) continue ;; esac   # only lives this app uploaded (by name)
         case "$f" in *.presenters.txt)   # who was on a live the cloud has taken (if it renamed it too)
             "$RCLONE" deletefile "$DEST/$f" --drive-use-trash=false --contimeout 15s --timeout 60s >/dev/null 2>&1; continue ;; esac
         is_video "$f" || continue
@@ -1061,6 +1087,7 @@ empty_bin() {   # [now]: once an hour (and straight after Drive reads full), del
     while IFS= read -r line; do
         size=${line%%;*}; path=${line#*;}
         case "$size" in ''|*[!0-9]*) continue ;; esac
+        case "$path" in "${DEST#*:}"/*) ;; *) continue ;; esac   # only inside the lives folder (by path)
         is_live_file "$path" || continue
         if "$RCLONE" deletefile "$REMOTE:$path" --drive-trashed-only --drive-use-trash=false \
                --contimeout 15s --timeout 60s >/dev/null 2>&1; then
