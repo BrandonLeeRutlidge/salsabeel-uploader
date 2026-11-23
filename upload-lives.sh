@@ -1237,7 +1237,8 @@ start_upload() {   # the next rclone: the whole file, or the next part; sets rcl
     # the speed ("authentication must be set up on the rc server to use core/bwlimit", seen on the Mac, 16 Nov).
     RC_PASS=$(od -An -N12 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
     if [ -z "$RC_PASS" ]; then RC_PASS="p$RANDOM$RANDOM$RANDOM"; fi
-    common=(--stats 2s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file "$PROGRESS"
+    # DEBUG: rclone says why it starts a file again only at this level ("Received error: … - low level retry n/20")
+    common=(--stats 2s --stats-one-line --stats-log-level NOTICE --log-level DEBUG --log-file "$PROGRESS"
             --rc --rc-addr "127.0.0.1:$port" --rc-user salsabeel --rc-pass "$RC_PASS")
     USR2=""   # rclone toggles its --bwlimit on and off on SIGUSR2: a second way to slow it, if its remote control fails
     if [ "$mode" = live ]; then common+=(--bwlimit "$(rate_of "$cap")")
@@ -1396,8 +1397,8 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
             fi
         fi
     fi
-    if [ -z "$err_logged" ] && grep -qE 'ERROR|googleapi' "$PROGRESS" 2>/dev/null; then   # seen as it happens, not hours later
-        err_logged=1; log "rclone says (it keeps trying): $(grep -m 1 -E 'ERROR|googleapi' "$PROGRESS" | cut -c1-300)"
+    if [ -z "$err_logged" ] && grep -qE 'ERROR|low level retry' "$PROGRESS" 2>/dev/null; then   # seen as it happens, not hours later
+        err_logged=1; log "rclone says (it keeps trying): $(grep -m 1 -E 'ERROR|low level retry' "$PROGRESS" | cut -c1-300)"
     fi
     line=$(grep -E ' / .*[0-9]+%' "$PROGRESS" 2>/dev/null | tail -n 1)
     if [ -z "$held" ] && [ -n "$line" ]; then
@@ -1472,7 +1473,7 @@ elif [ -n "$ok" ]; then
     if [ "$mode" = live ] && [ "$left" -gt 0 ]; then NOW_LINE="A live is on: $(plural "$left" "upload waits" "uploads wait"), the next goes slowly in a minute"
     elif [ "$left" -gt 0 ]; then NOW_LINE="Uploaded one: $(plural "$left" "live waits" "lives wait"), the next starts within a minute"; fi
 else
-    { grep -m 2 -E 'ERROR|googleapi|Failed to' "$PROGRESS" | cut -c1-300   # the head of rclone's error (what failed, and why) ...
+    { grep -m 2 -E 'ERROR|low level retry|Failed to' "$PROGRESS" | cut -c1-300   # the head of rclone's error (what failed, and why) ...
       grep -vE ' / .*[0-9]+%' "$PROGRESS" | tail -n 5; } >> "$LOG"           # ... and its end
     if grep -qiE 'storageQuotaExceeded|quota has been exceeded|quotaExceeded' "$PROGRESS"; then
         log "Google Drive is full: it stays in \"Ready to upload\" and is tried again in a minute."
