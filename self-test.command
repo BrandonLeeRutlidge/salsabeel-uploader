@@ -909,7 +909,7 @@ cat > "$ROOT/resend-rclone" <<EOF
 trap ':' USR2   # (real rclone takes this as "full speed")
 if [ "\$1" = move ]; then
     prev=""; for a in "\$@"; do if [ "\$prev" = --log-file ]; then lf=\$a; fi; prev=\$a; done
-    echo "2026/11/19 05:14:02 DEBUG : Salsabeel live.mp4: Received error: googleapi: Error 500: Internal Error, backendError - low level retry 1/20" >> "\$lf"
+    echo "2026/11/19 05:14:02 DEBUG : pacer: low level retry 1/20 (error Post \\"https://www.googleapis.com/upload/drive/v3/files?alt=json&fields=id%2Cname%2Csize%2Cmd5Checksum%2Ctrashed%2CexplicitlyTrashed%2CmodifiedTime%2CcreatedTime%2CmimeType%2Cparents%2CwebViewLink%2CshortcutDetails%2CexportLinks%2CresourceKey&supportsAllDrives=true&uploadType=resumable&upload_id=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\": googleapi: Error 500: Internal Error, backendError)" >> "\$lf"
     for i in 1 2 3 4 5 6 7 8 9 10; do
         echo "2026/11/19 05:14:0\$i NOTICE: Transferred:   	  \$(( i * 300 )) MiB / \$(( i * 300 + 100 )) MiB, 75%, 50 MiB/s, ETA 2s" >> "\$lf"; sleep 1
     done
@@ -924,7 +924,8 @@ printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\n' "$REC" "$DRIVE" "$ROO
 check "a file sent again and again: stopped once rclone's total grows past 1.5 times what it first said ($took s), not after hours, and it says why" \
       'grep -q "keeps refusing the end of this upload and rclone keeps starting it again" "$ROOT/test.log" && [ "$took" -lt 10 ] &&
        [ -e "$REC/Ready to upload/Salsabeel live 2026-11-15 19-09.mp4" ]'
-check "rclone's reason for starting again (its debug \"low level retry\" line) shows in the log while it's still trying" 'grep -q "rclone says (it keeps trying): .*googleapi: Error 500" "$ROOT/test.log"'
+check "rclone's reason for starting again (its debug \"low level retry\" line) shows in the log while it's still trying, without the web address's long tail" \
+      'grep -q "rclone says (it keeps trying): .*files\": googleapi: Error 500" "$ROOT/test.log" && ! grep -q "upload_id" "$ROOT/test.log"'
 check "then it waits 5 minutes before trying again (not every minute)" \
       '[ "$(cut -d" " -f2 "$ROOT/app/rate-wait")" = 5 ] && grep -q "Google Drive kept refusing the upload, so it waits 5 minutes" "$ROOT/test.log"'
 rm -f "$ROOT/app/rate-wait" "$REC/Ready to upload/Salsabeel live 2026-11-15 19-09.mp4"; setup "$DRIVE"
