@@ -19,6 +19,9 @@ export SALSABEEL_UPLOADER_TEMPLATE="$PWD/status-page.html"
 export HOME="$ROOT/home"                          # its backup copy and background job file stay in the test folder
 export SALSABEEL_UPLOADER_RECORDER="fakerec$$x"  # only the test's pretend LIVE Studio counts, never the real one
 export SALSABEEL_UPLOADER_MIN_LIVE_MB=0           # the test videos are tiny; one check below sets a size
+export SALSABEEL_UPLOADER_NO_WATCH=1                 # the live watcher off, except where it is tested
+printf '#!/bin/bash\necho "$*" >> "%s"\n' "$ROOT/launchctl-calls" > "$ROOT/fake-launchctl"; chmod +x "$ROOT/fake-launchctl"
+export SALSABEEL_UPLOADER_LAUNCHCTL="$ROOT/fake-launchctl"   # never starts a real background job
 export SALSABEEL_UPLOADER_TEST=1                  # it may follow recordings in temporary folders (where this test works)
 export SALSABEEL_UPLOADER_PING="$ROOT/fake-ping" SALSABEEL_UPLOADER_PING_HOSTS=testhost   # never the real internet
 mkdir -p "$HOME"
@@ -832,7 +835,7 @@ PATH="$ROOT/who-bin:$PATH" bash "$ROOT/app/upload-lives.sh" --who Alice 'B<e>a' 
 check "the window's page: the uploader's look (logo, LIVE UPLOADER), \"Clock in\", a tile per name (names made safe), and 2 columns for 5 names" \
       'W="$ROOT/app/who.html"; [ "$(grep -c "class=\"tile\"" "$W")" = 5 ] && grep -q "data:image/png;base64" "$W" && grep -q "<span>LIVE UPLOADER</span>" "$W" && grep -q "<h1>Clock in</h1>" "$W" && grep -q "Tap your name." "$W" &&
        grep -q "B&lt;e&gt;a" "$W" && grep -q "repeat(2, 1fr)" "$W" && grep -q "Thanks for clocking in" "$W" && sed -n 1p "$ROOT/osa-args" | grep -qx -- -l &&
-       grep -qx "$ROOT/app/who.html" "$ROOT/osa-args" && grep -qx 600 "$ROOT/osa-args"'
+       grep -qx "$ROOT/app/who.html" "$ROOT/osa-args" && grep -qx 760 "$ROOT/osa-args"'
 unset SALSABEEL_UPLOADER_ASK; rm -rf "$ROOT/app/presenters" "$ROOT/app/presenters.txt"; setup "$DRIVE"
 
 # Google Drive says "slow down" (403 rateLimitExceeded): it waits, longer each time, and never says "no internet"
@@ -939,6 +942,81 @@ check "parts off: an unfinished parts folder is deleted once its live has gone u
 check "parts off: a finished one (manifest), one whose live still waits here, and a non-live folder are all kept" \
       '[ -e "$PP/Salsabeel live 2026-11-16 10-00.mp4/manifest.txt" ] && [ -e "$PP/Salsabeel live 2026-11-16 11-00.mp4/part-0001" ] && [ -e "$PP/holiday/part-0001" ]'
 stop_live; rm -f "$REC/on_air.mp4" "$ROOT/app/paused" "$REC/Ready to upload/Salsabeel live 2026-11-16 11-00.mp4"; rm -rf "$PP"; setup "$DRIVE"
+
+# "Clock in" that can't be missed: seen within seconds of going live (the live watcher), and a chime until a tap
+printf '# Presenters\nAlice\nBea\nCara\n' > "$DRIVE/Uploader checks/Presenters.txt"; ago "$ROOT/app/presenters-checked" 20
+rm -rf "$ROOT/app/presenters" "$ROOT/app/live-on"; setup "$DRIVE"
+printf '#!/bin/bash\necho chime >> "%s"\n' "$ROOT/chimes" > "$ROOT/fake-chime"; chmod +x "$ROOT/fake-chime"; rm -f "$ROOT/chimes" "$ROOT/asked"
+printf '#!/bin/bash\necho "$*" >> "%s"\nsleep 5\necho "$2"\n' "$ROOT/asked" > "$ROOT/slow-tap"; chmod +x "$ROOT/slow-tap"
+: > "$ROOT/test.log"
+env -u SALSABEEL_UPLOADER_NO_WATCH SALSABEEL_UPLOADER_WATCH_EVERY=1 SALSABEEL_UPLOADER_ASK="$ROOT/slow-tap" \
+    SALSABEEL_UPLOADER_CHIME="$ROOT/fake-chime" SALSABEEL_UPLOADER_CHIME_EVERY=2 bash "$ROOT/app/upload-lives.sh"
+check "no live yet: the live watcher is waiting in the background" '[ -s "$ROOT/app/live-watch.pid" ] && kill -0 "$(cat "$ROOT/app/live-watch.pid")" 2>/dev/null'
+start_live; t0=$(date +%s)
+for i in $(seq 1 15); do grep -q "Asked \"Who are you?\"" "$ROOT/test.log" && break; sleep 1; done; seen=$(( $(date +%s) - t0 ))
+check "a live starts between runs: \"Clock in\" shows within seconds ($seen s), without waiting for the next minute" \
+      'grep -q "Live started" "$ROOT/test.log" && grep -q "Asked \"Who are you?\"" "$ROOT/test.log" && [ "$seen" -le 5 ]'
+for i in $(seq 1 15); do grep -q "(clicked)" "$ROOT/test.log" && break; sleep 1; done
+n_at_tap=$(grep -c . "$ROOT/chimes" 2>/dev/null || echo 0); sleep 5; n_after=$(grep -c . "$ROOT/chimes" 2>/dev/null || echo 0)
+check "a chime as it shows and again until a name is tapped ($n_at_tap), then no more ($n_after)" \
+      '[ "$n_at_tap" -ge 2 ] && [ "$n_at_tap" -le 4 ] && [ "$n_after" = "$n_at_tap" ] && [ "$(grep -c . "$ROOT/asked")" = 1 ]'
+stop_live; ago "$REC/on_air.mp4" 10; bash "$ROOT/app/upload-lives.sh"
+HP="$HOME/Library/LaunchAgents/com.salsabeel.clock-in.plist"
+check "the \"Clock in\" helper's background job is written and started (always running, its own job)" \
+      'grep -q "<string>--clock-in-helper</string>" "$HP" && grep -q "<key>KeepAlive</key><true/>" "$HP" && grep -q "^bootstrap gui/" "$ROOT/launchctl-calls"'
+: > "$ROOT/launchctl-calls"; bash "$ROOT/app/upload-lives.sh"
+check "... and only once (not again every minute)" '[ ! -s "$ROOT/launchctl-calls" ]'
+rm -f "$REC/on_air.mp4"
+# The helper: the window loaded and hidden, shown the moment LIVE Studio's recording file appears (Brandon, 24 Nov)
+cat > "$ROOT/fake-standby" <<EOF
+#!/bin/bash
+# A pretend window: "loads", waits hidden for the trigger, then "shows" (the time, in ms) and a name is tapped
+t=\$1; shift; sleep 1; echo ready > "\$t.ready"
+while [ ! -e "\$t" ]; do sleep 0.05; done
+python3 -c 'import time; print(int(time.time()*1000))' > "$ROOT/shown-at"; echo "\$*" > "$ROOT/standby-names"
+sleep 1; echo "\$1"; sleep 3
+EOF
+chmod +x "$ROOT/fake-standby"; rm -f "$ROOT/shown-at" "$ROOT/chimes"; : > "$ROOT/test.log"
+# Offline, and the uploader not running (Brandon, 24 Nov): no network, Drive or rclone at all, and no names copy
+# here but the hidden backup of the last list. It must still show at once and save the tap on this Mac.
+printf '#!/bin/bash\necho "$*" >> "%s"\nexit 1\n' "$ROOT/offline-calls" > "$ROOT/offline-rclone"; chmod +x "$ROOT/offline-rclone"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\n' "$REC" "$DRIVE" "$ROOT/offline-rclone" > "$ROOT/app/config.sh"
+rm -f "$ROOT/offline-calls" "$ROOT/app/running.pid" "$ROOT/app/presenters.txt"; echo '20 5' > "$ROOT/ping-seq"
+check "(the hidden backup has the last names list)" 'grep -qx Alice "$HOME/.salsabeel-uploader/presenters.txt"'
+mv "$HOME/.salsabeel-uploader/presenters.txt" "$ROOT/backup-names"; rm -f "$ROOT/app/presenters.txt"
+cp "$ROOT/backup-names" "$HOME/.salsabeel-uploader/presenters.txt"
+SALSABEEL_UPLOADER_STANDBY_CMD="$ROOT/fake-standby" SALSABEEL_UPLOADER_HELPER_SECONDS=40 SALSABEEL_UPLOADER_CHIME="$ROOT/fake-chime" \
+    bash "$ROOT/app/upload-lives.sh" --clock-in-helper & helper=$!
+for i in $(seq 1 40); do [ -f "$ROOT/app/standby/trigger.ready" ] && break; sleep 0.25; done
+check "the helper keeps the window loaded and hidden, and never takes the uploader's turn" \
+      '[ -f "$ROOT/app/standby/trigger.ready" ] && [ ! -e "$ROOT/app/standby/trigger" ] && [ ! -f "$ROOT/app/running.pid" ]'
+made=$(python3 -c 'import time; print(int(time.time()*1000))'); head -c 4096 /dev/zero > "$REC/fresh live.mp4"
+for i in $(seq 1 40); do [ -f "$ROOT/shown-at" ] && break; sleep 0.1; done
+shown_ms=$(( $(cat "$ROOT/shown-at" 2>/dev/null || echo 99999999999999) - made ))
+check "offline, uploader not running: a recording appears and \"Clock in\" shows in $shown_ms ms (under 1 second), with the names" \
+      '[ "$shown_ms" -ge 0 ] && [ "$shown_ms" -lt 1000 ] && [ "$(cat "$ROOT/standby-names")" = "Alice Bea Cara" ] && grep -q "Live started (file \"$REC/fresh live.mp4\")" "$ROOT/test.log"'
+for i in $(seq 1 20); do grep -q "(clicked)" "$ROOT/test.log" && break; sleep 0.5; done
+check "... the name tapped on it is saved on this Mac with the time, the chime played, and nothing went online" \
+      'grep -q "Alice.*(clicked)" "$ROOT/test.log" && grep -qx Alice "$ROOT/app/presenters/"*.names && [ -s "$ROOT/app/presenters/"*.at ] && [ -s "$ROOT/chimes" ] && [ ! -e "$ROOT/offline-calls" ]'
+ago "$REC/fresh live.mp4" 10; rm -f "$ROOT/app/live-on" "$ROOT/shown-at"
+for i in $(seq 1 60); do [ -f "$ROOT/app/standby/trigger.ready" ] && [ ! -e "$ROOT/app/standby/trigger" ] && break; sleep 0.25; done
+check "after the live: a fresh window is loaded and waiting for the next one" \
+      '[ -f "$ROOT/app/standby/trigger.ready" ] && [ ! -e "$ROOT/app/standby/trigger" ] && kill -0 "$(cat "$ROOT/app/standby/pid")"'
+kill "$helper" 2>/dev/null; wait "$helper" 2>/dev/null; kill "$(cat "$ROOT/app/standby/pid" 2>/dev/null)" 2>/dev/null; rm -rf "$ROOT/app/standby"
+# A restart before it was sent (everything stopped), then back online later: the tap still goes up with that live
+rm -f "$ROOT/ping-seq"; setup "$DRIVE"; ago "$REC/fresh live.mp4" 10; : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+sent=$(sed -n 's/.*Sent who was on "\(.*\)" to Drive (Alice)\./\1/p' "$ROOT/test.log" | head -n 1)
+check "restarted, then online again: who tapped in goes to Drive with that live ($sent)" \
+      '[ -n "$sent" ] && ls "$DRIVE" | grep -q "presenters.txt" && [ -z "$(ls "$ROOT/app/presenters/" 2>/dev/null)" ]'
+rm -rf "$ROOT/app/presenters" "$ROOT/app/presenters.txt" "$DRIVE/Uploader checks/Presenters.txt"; setup "$DRIVE"
+
+# The note says what LIVE Studio's own files say about sound (does the chime go out on the live?)
+mkdir -p "$HOME/Library/Application Support/TikTok LIVE Studio"
+printf '{"recordPath":"/x","audioCaptureMode":"desktopAndMic","micVolume":80,"theme":"dark"}\n' > "$HOME/Library/Application Support/TikTok LIVE Studio/settings.json"
+rm -f "$ROOT/app/live-studio-sound" "$ROOT/app/status-sent"; setup "$DRIVE"; bash "$ROOT/app/upload-lives.sh"
+check "the note has LIVE Studio's sound settings (from its own files), and nothing else from them" \
+      'grep -q "^LIVE Studio sound: .*\"audioCaptureMode\":\"desktopAndMic\"" "$NOTE" && grep -q "\"micVolume\":80" "$NOTE" && ! grep -q "theme" "$NOTE"'
+rm -rf "$HOME/Library/Application Support/TikTok LIVE Studio" "$ROOT/app/live-studio-sound"
 
 if [ -f manifest.txt ]; then
     check "manifest.txt matches these files (run streaming-mac/build.sh after a change)" \
