@@ -99,6 +99,10 @@ CHECKS_FOLDER="Uploader checks"
 # The answer goes next to the live in Drive as "<recording>.presenters.txt", one name per line.
 PRESENTERS_ASK=on
 PRESENTERS_WAIT="${SALSABEEL_UPLOADER_ASK_WAIT:-600}"   # the list closes by itself after this long
+PRESENTERS_CHIME=on            # a soft chime when "Clock in" shows, again every PRESENTERS_CHIME_EVERY seconds until a tap
+PRESENTERS_CHIME_EVERY="${SALSABEEL_UPLOADER_CHIME_EVERY:-60}"
+PRESENTERS_CHIME_SOUND=/System/Library/Sounds/Glass.aiff   # macOS's own, about a second long
+PRESENTERS_CHIME_VOLUME=0.3    # soft (0 to 1): in case LIVE Studio picks up the Mac's own sound
 PRESENTERS_EVERY=600           # how often it reads the names again
 ASK="${SALSABEEL_UPLOADER_ASK:-}"   # (the self-test: a pretend list)
 TEMPLATE="${SALSABEEL_UPLOADER_TEMPLATE:-$APP_DIR/status-page.html}"
@@ -115,7 +119,7 @@ touch "$APP_DIR/last-run"     # "Fix Salsabeel uploader" reads this to see that 
 
 # Put back anything of its own that has gone missing (moved or deleted), from the backup copy.
 RESTORED=""
-for f in config.sh status-page.html VERSION self-test.command show-log.command uninstall.command google-app; do
+for f in config.sh status-page.html VERSION self-test.command show-log.command uninstall.command google-app presenters.txt; do
     if [ ! -f "$APP_DIR/$f" ] && [ -f "$BACKUP/$f" ] && cp -p "$BACKUP/$f" "$APP_DIR/$f"; then RESTORED="$RESTORED $f"; fi
 done
 if [ ! -x "$APP_DIR/bin/rclone" ] && [ -x "$BACKUP/bin/rclone" ] && mkdir -p "$APP_DIR/bin" &&
@@ -209,9 +213,9 @@ WHO_COLS=1; WHO_W=460; WHO_H=300
 who_page() {   # names...: writes $APP_DIR/who.html from the status page's own look; sets WHO_W and WHO_H
     local f="$APP_DIR/who.html" name rows
     [ -f "$TEMPLATE" ] && grep -q 'class="brand"' "$TEMPLATE" || return 1
-    WHO_COLS=1; WHO_W=460
-    if [ $# -gt 4 ]; then WHO_COLS=2; WHO_W=600; fi
-    rows=$(( ($# + WHO_COLS - 1) / WHO_COLS )); WHO_H=$(( 295 + rows * 66 )); if [ "$WHO_H" -lt 380 ]; then WHO_H=380; fi
+    WHO_COLS=1; WHO_W=560   # big, so nobody can miss it (Brandon, 24 Nov)
+    if [ $# -gt 6 ]; then WHO_COLS=3; WHO_W=960; elif [ $# -gt 3 ]; then WHO_COLS=2; WHO_W=760; fi
+    rows=$(( ($# + WHO_COLS - 1) / WHO_COLS )); WHO_H=$(( 330 + rows * 92 )); if [ "$WHO_H" -lt 440 ]; then WHO_H=440; fi
     {
         printf '<!DOCTYPE html>\n<html lang="en-GB">\n<head>\n<meta charset="utf-8">\n<title>Salsabeel: clock in</title>\n'
         sed -n '/<style>/,/<\/style>/p' "$TEMPLATE"
@@ -219,16 +223,17 @@ who_page() {   # names...: writes $APP_DIR/who.html from the status page's own l
 <style>
   body { padding: 20px; user-select: none; -webkit-user-select: none; cursor: default; }
   .card { max-width: none; }
-  .grid { display: grid; grid-template-columns: repeat($WHO_COLS, 1fr); gap: 10px; margin-top: 18px; }
-  .tile { font: inherit; font-size: 20px; font-weight: 600; color: var(--text); background: #232327;
-    border: 1px solid var(--line); border-radius: 14px; padding: 15px 10px; cursor: pointer; }
+  .grid { display: grid; grid-template-columns: repeat($WHO_COLS, 1fr); gap: 14px; margin-top: 22px; }
+  .tile { font: inherit; font-size: 28px; font-weight: 700; color: var(--text); background: #232327;
+    border: 2px solid var(--line); border-radius: 16px; padding: 22px 10px; cursor: pointer; }
+  #who h1 { font-size: 38px; }
   .tile:hover { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255,45,111,.25), 0 0 18px rgba(255,45,111,.35); }
   .tile:active { background: rgba(255,45,111,.18); }
   #thanks { display: none; }
   .picked #who { display: none; }
   .picked #thanks { display: block; }
   #thanks .msg { margin-bottom: 4px; }
-  .sub { font-size: 15px; color: var(--muted); margin: -4px 0 0; }
+  .sub { font-size: 19px; color: var(--muted); margin: -4px 0 0; }
 </style>
 </head>
 <body>
@@ -246,7 +251,8 @@ CSS
         printf '    document.body.classList.add("picked"); document.title = "picked:" + n; }\n'
         printf '  document.querySelectorAll(".tile").forEach(function (b) { b.addEventListener("click", function () { pick(b.textContent); }); });\n'
         if [ -n "${SALSABEEL_WHO_TEST_PICK:-}" ]; then
-            printf '  setTimeout(function () { document.querySelectorAll(".tile").forEach(function (b) { if (b.textContent === "%s") b.click(); }); }, 2500);\n' "$(html_esc "$SALSABEEL_WHO_TEST_PICK")"
+            printf '  var seen = 0; setInterval(function () { if (document.visibilityState !== "visible") return; if (!seen) seen = Date.now();\n'
+            printf '    if (Date.now() - seen > 2500) document.querySelectorAll(".tile").forEach(function (b) { if (b.textContent === "%s") b.click(); }); }, 250);\n' "$(html_esc "$SALSABEEL_WHO_TEST_PICK")"
         fi
         printf '</script>\n</body>\n</html>\n'
     } > "$f.tmp" && mv -f "$f.tmp" "$f"
@@ -254,6 +260,8 @@ CSS
 WHO_WINDOW='ObjC.import("Cocoa"); ObjC.import("WebKit");
 function run(argv) {
   var page = argv[0], W = Number(argv[1]), H = Number(argv[2]);
+  var trigger = argv[3] || "";   // standby: load now, hidden; show the moment this file appears (instant)
+  var fm = $.NSFileManager.defaultManager;
   var app = $.NSApplication.sharedApplication, picked = "", closed = false, shown = 0, snapped = {};
   var testSnap = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey("SALSABEEL_WHO_TEST_SNAP")) || "";
   app.setActivationPolicy(1);   // no Dock icon
@@ -265,7 +273,9 @@ function run(argv) {
     if (ev && !ev.isNil()) app.sendEvent(ev);
   }
   var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, W, H), 1 | 2, 2, false);
-  win.title = "Salsabeel"; win.level = 3; win.releasedWhenClosed = false; win.delegate = $.SalsabeelWho.alloc.init;
+  win.title = "Salsabeel"; win.releasedWhenClosed = false; win.delegate = $.SalsabeelWho.alloc.init;
+  win.level = 1000;               // above every other window, menus and the Dock (the screen saver level)
+  win.collectionBehavior = 1 | 16 | 256;   // every Space, stays put, and over full-screen apps (like LIVE Studio)
   win.backgroundColor = $.NSColor.colorWithSRGBRedGreenBlueAlpha(14 / 255, 14 / 255, 16 / 255, 1);
   var wv = $.WKWebView.alloc.initWithFrameConfiguration($.NSMakeRect(0, 0, W, H), $.WKWebViewConfiguration.alloc.init);
   win.contentView = wv;
@@ -281,14 +291,26 @@ function run(argv) {
       });
     } catch (e) { $(String(e)).writeToFileAtomicallyEncodingError(testSnap + "/" + name + ".err", true, 4, $()); }
   }
-  var t0 = Date.now();
-  while (!picked && !closed && Date.now() - t0 < 900000) {   // the shell closes it sooner (10 minutes)
-    pump(0.1);
+  var t0 = Date.now(), ready = false;
+  while (!picked && !closed && (!shown || Date.now() - shown < 900000)) {   // the shell closes it sooner (10 minutes)
+    pump(shown || !trigger ? 0.1 : 0.05);
     var t = title();
-    if (!shown && t.indexOf("Salsabeel") === 0) { win.center; app.activateIgnoringOtherApps(true); win.makeKeyAndOrderFront(null); shown = Date.now(); }
-    if (!shown && Date.now() - t0 > 10000) throw new Error("the page did not open");
+    if (!ready && t.indexOf("Salsabeel") === 0) {
+      ready = true;
+      if (trigger) $("ready").writeToFileAtomicallyEncodingError(trigger + ".ready", true, 4, $());
+    }
+    if (!shown && ready && (!trigger || fm.fileExistsAtPath(trigger))) {   // centred on the main screen, in front of everything
+      var sf = $.NSScreen.mainScreen.frame;
+      win.setFrameOrigin($.NSMakePoint(sf.origin.x + (sf.size.width - W) / 2, sf.origin.y + (sf.size.height - H) / 2));
+      app.activateIgnoringOtherApps(true); win.makeKeyAndOrderFront(null); win.orderFrontRegardless;
+      shown = Date.now();
+    }
+    if (!ready && Date.now() - t0 > 10000) throw new Error("the page did not open");
+    if (shown && testSnap && !snapped["shown"]) {   // (a check: how fast it showed)
+      snapped["shown"] = true; $(String(Date.now())).writeToFileAtomicallyEncodingError(testSnap + "/shown-at", true, 4, $());
+    }
     if (shown && Date.now() - shown > 1500) snap("1-who");
-    if (t.indexOf("picked:") === 0) picked = t.slice(7);
+    if (shown && t.indexOf("picked:") === 0) picked = t.slice(7);
   }
   if (picked) {
     $.NSFileHandle.fileHandleWithStandardOutput.writeData($(picked + "\n").dataUsingEncoding(4));   // the name, first
@@ -416,6 +438,23 @@ live_presenters() {   # the name(s) clicked for the live on now, comma-separated
         if [ "$(cat "$s")" = "$on" ] && [ -s "${s%.src}.names" ]; then paste -sd ',' "${s%.src}.names" | sed 's/,/, /g'; return 0; fi
     done
 }
+live_studio_sound() {   # LIVE Studio's sound settings, from its own files (once an hour): does the Mac's sound go out?
+    local c="$APP_DIR/live-studio-sound" spot f
+    if [ -f "$c" ] && [ $(( $(date +%s) - $(mtime "$c") )) -lt 3600 ]; then cat "$c"; return 0; fi
+    for spot in "$HOME/Library/Application Support" "$HOME/Library/Preferences"; do
+        find "$spot" -maxdepth 1 \( -iname '*tiktok*' -o -iname '*live*studio*' \) 2>/dev/null
+    done | while IFS= read -r spot; do
+        find "$spot" -maxdepth 6 -type f -size -5M 2>/dev/null | head -n 300 | while IFS= read -r f; do
+            case "$f" in
+                *.plist) if command -v plutil >/dev/null 2>&1; then plutil -convert json -o - "$f" 2>/dev/null; fi ;;
+                *.json|*.ini|*.cfg|*.conf|*.config|*.txt|*.xml) LC_ALL=C cat "$f" 2>/dev/null ;;
+            esac
+        done
+    done | LC_ALL=C grep -a -o -i -E '"[A-Za-z_]*(audio|sound|mic|speaker|desktop|system)[A-Za-z_]*" *: *("[^"]{0,40}"|-?[0-9.]+|true|false)' 2>/dev/null |
+        LC_ALL=C sort -u | head -n 12 | paste -sd ';' - | sed 's/;/; /g' | cut -c1-400 > "$c.new"
+    if [ ! -s "$c.new" ]; then echo "(no sound settings found in LIVE Studio's files)" > "$c.new"; fi
+    mv -f "$c.new" "$c"; cat "$c"
+}
 send_status() {
     local note="$APP_DIR/Mac status.txt" drive mac waiting=0 ready=0 f who
     rm -f "$APP_DIR/status-due"   # (set again below if this one doesn't go)
@@ -440,6 +479,7 @@ send_status() {
             echo "Asleep:             $(cat "$APP_DIR/last-sleep")"
         fi
         echo "Line:               $(line_report)"
+        echo "LIVE Studio sound:  $(live_studio_sound)"
         echo "Mac:                $mac"
         echo "Version:            $(cat "$APP_DIR/VERSION" 2>/dev/null || echo unknown)"
         echo "Recording folder:   $WATCH_DIR"
@@ -542,7 +582,7 @@ backup_self() {   # keep the hidden copy up to date (only what changed is copied
     local f conf
     mkdir -p "$BACKUP/bin" 2>/dev/null || return 0
     chmod 700 "$BACKUP" 2>/dev/null
-    for f in upload-lives.sh status-page.html config.sh VERSION self-test.command show-log.command uninstall.command google-app; do
+    for f in upload-lives.sh status-page.html config.sh VERSION self-test.command show-log.command uninstall.command google-app presenters.txt; do
         if [ -f "$APP_DIR/$f" ] && ! cmp -s "$APP_DIR/$f" "$BACKUP/$f"; then cp -p "$APP_DIR/$f" "$BACKUP/$f"; fi
     done
     if [ -x "$APP_DIR/bin/rclone" ] && { [ ! -x "$BACKUP/bin/rclone" ] || [ "$APP_DIR/bin/rclone" -nt "$BACKUP/bin/rclone" ]; }; then
@@ -714,13 +754,17 @@ note_sleep
 
 # One copy at a time (launchd already avoids overlaps; this covers a manual run as well).
 PIDFILE="$APP_DIR/running.pid"
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then exit 0; fi
-echo $$ > "$PIDFILE"
-trap 'rm -f "$PIDFILE"' EXIT
+if [ "${1:-}" != --clock-in-helper ]; then   # (the "Clock in" helper runs alongside, below)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then exit 0; fi
+    echo $$ > "$PIDFILE"
+    trap 'rm -f "$PIDFILE"' EXIT
+fi
 # "Fix Salsabeel uploader" is switching the Google sign-in: start nothing until it's done (at most 30 minutes)
-if [ -f "$APP_DIR/fixer-hold" ] && [ $(( $(date +%s) - $(mtime "$APP_DIR/fixer-hold") )) -lt 1800 ]; then exit 0; fi
-
-update_if_due
+HELPER_RUN=""; if [ "${1:-}" = --clock-in-helper ]; then HELPER_RUN=1; fi
+if [ -z "$HELPER_RUN" ]; then
+    if [ -f "$APP_DIR/fixer-hold" ] && [ $(( $(date +%s) - $(mtime "$APP_DIR/fixer-hold") )) -lt 1800 ]; then exit 0; fi
+    update_if_due   # (only the uploader updates; the helper picks the new version up when it next starts)
+fi
 
 mkdir -p "$READY"
 now=$(date +%s)
@@ -792,8 +836,10 @@ keep_open_note() {   # a live has ended with uploads left: ask them (once, on sc
 PRES="$APP_DIR/presenters"   # per live: <id>.src (the file LIVE Studio records to), <id>.names (the answer),
                              # <id>.name (the recording's name in Drive, once it has one)
 presenter_names() {   # the names to tick: one per line; blank lines and lines starting # left out
-    [ -f "$APP_DIR/presenters.txt" ] || return 0
-    tr -d '\r' < "$APP_DIR/presenters.txt" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
+    local f="$APP_DIR/presenters.txt"   # this Mac's copy (never waits on Drive), or the hidden backup of the last list
+    if [ ! -f "$f" ]; then f="$BACKUP/presenters.txt"; fi
+    [ -f "$f" ] || return 0
+    tr -d '\r' < "$f" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
         grep -v '^#' | grep -v '^$' || true
 }
 read_presenters() {   # the names list from Drive (every PRESENTERS_EVERY). The Mac can only see files it made itself,
@@ -820,14 +866,14 @@ read_presenters() {   # the names list from Drive (every PRESENTERS_EVERY). The 
         log "Made \"$CHECKS_FOLDER/Presenters.txt\" in Drive, for the cloud to fill with the presenters' names."
     fi
 }
-got_name() {   # base: a name has come back? Saved at once (kept even if the window then fails or hangs)
-    local base=$1 n
-    [ -s "$base.answer" ] || return 1
-    tr -d '\r' < "$base.answer" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' | awk '!s[$0]++' > "$base.ticked"
+got_name() {   # base [answer file]: a name has come back? Saved at once (kept even if the window then fails or hangs)
+    local base=$1 ans=${2:-$1.answer} n
+    [ -s "$ans" ] || return 1
+    tr -d '\r' < "$ans" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' | awk '!s[$0]++' > "$base.ticked"
     n=$(grep -c . "$base.ticked" || true)
     if [ "$n" -eq 0 ]; then rm -f "$base.ticked"; return 1; fi
     if [ -f "$base.src" ]; then
-        mv -f "$base.ticked" "$base.names"
+        mv -f "$base.ticked" "$base.names"; date '+%Y-%m-%d %H:%M:%S' > "$base.at"   # saved on this Mac; Drive gets it whenever it can
         touch "$APP_DIR/status-due"   # the note says who it is within a minute
         log "Who's on this live: $(paste -sd ',' "$base.names" | sed 's/,/, /g') (clicked)."
     else
@@ -835,29 +881,42 @@ got_name() {   # base: a name has come back? Saved at once (kept even if the win
     fi
     return 0
 }
-THANKS_MAX="${SALSABEEL_UPLOADER_THANKS_MAX:-15}"   # once a name is in, the window gets this long to say thanks and close
+THANKS_MAX="${SALSABEEL_UPLOADER_THANKS_MAX:-15}"
+chime() {   # a short, soft sound so they look at the screen ("Clock in" is waiting); never held up by it
+    [ "$PRESENTERS_CHIME" = on ] || return 0
+    if [ -n "${SALSABEEL_UPLOADER_CHIME:-}" ]; then "$SALSABEEL_UPLOADER_CHIME" >/dev/null 2>&1 &
+    elif command -v afplay >/dev/null 2>&1; then afplay -v "$PRESENTERS_CHIME_VOLUME" "$PRESENTERS_CHIME_SOUND" >/dev/null 2>&1 &
+    fi
+}   # once a name is in, the window gets this long to say thanks and close
 ask_window() {   # base names...: on this Mac's screen; the name clicked goes to base.names (none if closed or left)
-    local base=$1 pid t=0 st=0 how=window saved="" limit
+    local base=$1 pid t=0 st=0 how=window saved="" limit ans adopted=""
     shift
-    if [ -n "$ASK" ]; then "$ASK" "$@" > "$base.answer" 2>/dev/null & else who_window "$@" > "$base.answer" 2>/dev/null & fi
-    pid=$!
+    ans="$base.answer"
+    if [ -n "${ADOPT_STANDBY:-}" ] && standby_ready; then   # the window is loaded and waiting: show it now
+        touch "$STANDBY/trigger"; pid=$(cat "$STANDBY/pid"); ans="$STANDBY/out"; adopted=1
+    elif [ -n "$ASK" ]; then "$ASK" "$@" > "$ans" 2>/dev/null & pid=$!
+    else who_window "$@" > "$ans" 2>/dev/null & pid=$!
+    fi
     while :; do
         limit=$PRESENTERS_WAIT
         while kill -0 "$pid" 2>/dev/null && [ "$t" -lt "$limit" ]; do
+            if [ -z "$saved" ] && [ $(( t % PRESENTERS_CHIME_EVERY )) -eq 1 ]; then chime; fi   # as it shows, then every minute
             sleep 1; t=$((t + 1))
-            if [ -z "$saved" ] && got_name "$base"; then saved=1; limit=$(( t + THANKS_MAX )); fi
+            if [ -z "$saved" ] && got_name "$base" "$ans"; then saved=1; limit=$(( t + THANKS_MAX )); fi
         done
         if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; st=timeout
+        elif [ -n "$adopted" ]; then if [ "$t" -le 3 ]; then st=1; else st=0; fi   # (not this shell's child: no exit code)
         else wait "$pid"; st=$?; fi
-        if [ -z "$saved" ] && got_name "$base"; then saved=1; fi
+        if [ -z "$saved" ] && got_name "$base" "$ans"; then saved=1; fi
         if [ -n "$saved" ] || [ "$st" = 0 ] || [ "$st" = timeout ] || [ "$how" = list ] || [ "$t" -gt 15 ]; then break; fi
         log "The \"Who are you?\" window would not open (error $st), so it asks with a plain list instead."
-        how=list
-        if [ -n "${SALSABEEL_UPLOADER_ASK2:-}" ]; then "$SALSABEEL_UPLOADER_ASK2" "$@" > "$base.answer" 2>/dev/null &
-        else who_list "$@" > "$base.answer" 2>/dev/null & fi
+        how=list; adopted=""; ans="$base.answer"
+        if [ -n "${SALSABEEL_UPLOADER_ASK2:-}" ]; then "$SALSABEEL_UPLOADER_ASK2" "$@" > "$ans" 2>/dev/null &
+        else who_list "$@" > "$ans" 2>/dev/null & fi
         pid=$!
     done
     rm -f "$base.answer"
+    if [ -n "$adopted" ] || [ -e "$STANDBY/trigger" ]; then rm -f "$STANDBY/out" "$STANDBY/trigger" "$STANDBY/trigger.ready" "$STANDBY/pid"; fi
     if [ -n "$saved" ]; then
         if [ "$how" = list ] && [ -f "$base.names" ]; then thanks_note "$(head -n 1 "$base.names")"; fi
     elif [ "$st" = timeout ]; then
@@ -887,6 +946,91 @@ read_google_app() {   # the "Uploader checks" listing
         log "Made \"$CHECKS_FOLDER/$GOOGLE_APP_FILE\" in Drive, for the cloud to fill in."
     fi
 }
+# The "Clock in" helper (Brandon, 24 Nov: "it needs to be instant the moment they press the live button"):
+# a small background job of its own (launchd, always running) that keeps the window loaded but hidden, looks at
+# LIVE Studio's save folder 4 times a second, and shows the window the moment a recording appears. Starting the
+# window from cold takes a few seconds; showing a loaded one is instant.
+HELPER_LABEL="com.salsabeel.clock-in"
+HELPER_PLIST="${SALSABEEL_UPLOADER_HELPER_PLIST:-$HOME/Library/LaunchAgents/$HELPER_LABEL.plist}"
+STANDBY="$APP_DIR/standby"
+standby_ready() {   # loaded, hidden and not yet shown
+    [ -s "$STANDBY/pid" ] && kill -0 "$(cat "$STANDBY/pid")" 2>/dev/null && [ -f "$STANDBY/trigger.ready" ] && [ ! -e "$STANDBY/trigger" ]
+}
+standby_stop() {
+    if [ -s "$STANDBY/pid" ]; then kill "$(cat "$STANDBY/pid")" 2>/dev/null; fi
+    rm -f "$STANDBY/pid" "$STANDBY/out" "$STANDBY/trigger" "$STANDBY/trigger.ready" "$STANDBY/names"
+}
+standby_start() {   # a window, loaded and hidden, for the names in Drive now
+    local names=() n
+    while IFS= read -r n; do names+=("$n"); done < <(presenter_names)
+    [ "${#names[@]}" -gt 0 ] || return 0
+    mkdir -p "$STANDBY"; standby_stop
+    presenter_names > "$STANDBY/names"
+    set -m   # its own process group: it outlives whoever started it
+    if [ -n "${SALSABEEL_UPLOADER_STANDBY_CMD:-}" ]; then   # (the self-test: a pretend window)
+        "$SALSABEEL_UPLOADER_STANDBY_CMD" "$STANDBY/trigger" "${names[@]}" > "$STANDBY/out" 2>/dev/null </dev/null &
+    else
+        who_page "${names[@]}" && cp -f "$APP_DIR/who.html" "$STANDBY/who.html" &&
+            osascript -l JavaScript -e "$WHO_WINDOW" "$STANDBY/who.html" "$WHO_W" "$WHO_H" "$STANDBY/trigger" \
+                > "$STANDBY/out" 2>/dev/null </dev/null &
+    fi
+    echo $! > "$STANDBY/pid"
+    set +m
+}
+clock_in_helper() {   # the helper's loop (an hour at a time; launchd starts it again, with any new version)
+    local end n=0 f
+    end=$(( $(date +%s) + ${SALSABEEL_UPLOADER_HELPER_SECONDS:-3600} ))
+    mkdir -p "$STANDBY"; touch "$STANDBY/mark"
+    while [ "$(date +%s)" -lt "$end" ]; do
+        n=$((n + 1))
+        if [ "$PRESENTERS_ASK" = on ] && [ ! -f "$APP_DIR/live-on" ] && [ -n "$(presenter_names | head -n 1)" ]; then
+            if ! standby_ready && { [ ! -s "$STANDBY/pid" ] || ! kill -0 "$(cat "$STANDBY/pid")" 2>/dev/null ||
+                                    ! presenter_names | cmp -s - "$STANDBY/names"; }; then
+                if [ ! -e "$STANDBY/trigger" ]; then standby_start; fi
+            fi
+            # a recording that started since the last look (LIVE Studio writes to it all the time)
+            f=$(find "$WATCH_DIR" -maxdepth 3 \( -path "$READY" -o -name '.*' \) -prune -o -type f \
+                     \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.mkv' -o -iname '*.flv' \) -newer "$STANDBY/mark" -print 2>/dev/null | head -n 1)
+            touch "$STANDBY/mark"
+            if [ -n "$f" ]; then recording_now "$f" >/dev/null 2>&1; fi
+        fi
+        sleep "${SALSABEEL_UPLOADER_HELPER_EVERY:-0.25}"
+    done
+    if [ ! -e "$STANDBY/trigger" ]; then standby_stop; fi   # a window in use is left to finish
+}
+helper_plist() {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$HELPER_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$(xml "$APP_DIR/upload-lives.sh")</string>
+        <string>--clock-in-helper</string>
+    </array>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>/dev/null</string>
+    <key>StandardErrorPath</key><string>/dev/null</string>
+</dict>
+</plist>
+EOF
+}
+ensure_helper() {   # the helper's background job: written and started once (and again if it changes or goes)
+    local lc="${SALSABEEL_UPLOADER_LAUNCHCTL:-launchctl}"
+    [ "$PRESENTERS_ASK" = on ] || return 0
+    command -v "$lc" >/dev/null 2>&1 || [ -n "${SALSABEEL_UPLOADER_HELPER_PLIST:-}" ] || return 0
+    if helper_plist | cmp -s - "$HELPER_PLIST"; then return 0; fi
+    mkdir -p "$(dirname "$HELPER_PLIST")" && helper_plist > "$HELPER_PLIST.tmp" && mv -f "$HELPER_PLIST.tmp" "$HELPER_PLIST" || return 0
+    "$lc" bootout "gui/$(id -u)/$HELPER_LABEL" >/dev/null 2>&1
+    if "$lc" bootstrap "gui/$(id -u)" "$HELPER_PLIST" >/dev/null 2>&1 || "$lc" load -w "$HELPER_PLIST" >/dev/null 2>&1; then
+        log "Started the \"Clock in\" helper (it shows \"Clock in\" the moment a live starts)."
+    fi
+}
 ask_presenters() {   # a live has started (the file it records to): ask "Who are you?", once per recording
     local s id n names=()
     [ "$PRESENTERS_ASK" = on ] || return 0
@@ -899,7 +1043,7 @@ ask_presenters() {   # a live has started (the file it records to): ask "Who are
     # In the background, in its own process group, so it never holds anything up and outlives this run
     # (launchd ends whatever is left in a run's group when the run ends).
     set -m
-    ask_window "$PRES/$id" "${names[@]}" </dev/null >/dev/null 2>&1 &
+    ADOPT_STANDBY=1 ask_window "$PRES/$id" "${names[@]}" </dev/null >/dev/null 2>&1 &
     set +m
     log "Asked \"Who are you?\" on this Mac's screen ($(plural "${#names[@]}" name names); it closes by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes))."
 }
@@ -920,12 +1064,12 @@ send_presenters() {   # answers whose recording has its name: "<recording>.prese
     t=$(date +%s)
     for s in "$PRES"/*.names; do
         b=${s%.names}
-        if [ ! -f "$b.src" ]; then rm -f "$s"; continue; fi
+        if [ ! -f "$b.src" ]; then rm -f "$s" "$b.at"; continue; fi
         [ -s "$b.name" ] || continue
         name=$(cat "$b.name")
         if "$RCLONE" copyto "$s" "$DEST/$name.presenters.txt" --contimeout 15s --timeout 60s >/dev/null 2>&1; then
             log "Sent who was on \"$(live_name "$name")\" to Drive ($(paste -sd ',' "$s" | sed 's/,/, /g'))."
-            rm -f "$b.src" "$b.name" "$s"
+            rm -f "$b.src" "$b.name" "$b.at" "$s"
         fi
     done
     for s in "$PRES"/*.src; do   # asked over a day ago and never answered: forget it
@@ -934,8 +1078,8 @@ send_presenters() {   # answers whose recording has its name: "<recording>.prese
     done
 }
 recording_now() {   # is a live on? LIVE Studio has a recording open, or a recording changed in the last 90 seconds
-    local f t on=""
-    on=$(live_studio_videos | head -n 1)
+    local f t on="${1:-}"   # [the recording, when the helper has just seen it appear]
+    if [ -z "$on" ]; then on=$(live_studio_videos | head -n 1); fi
     if [ -z "$on" ]; then
         t=$(date +%s)
         while IFS= read -r f; do
@@ -943,9 +1087,15 @@ recording_now() {   # is a live on? LIVE Studio has a recording open, or a recor
         done < <(recordings; if [ -s "$FOLLOW" ]; then cat "$FOLLOW"; fi)
     fi
     if [ -n "$on" ]; then
-        if [ ! -f "$APP_DIR/live-on" ]; then
-            echo "$on" > "$APP_DIR/live-on"; log "Live started (file \"$on\")."; touch "$APP_DIR/status-due"
-            ask_presenters "$on"
+        if [ ! -f "$APP_DIR/live-on" ]; then   # (the live watcher below may be here at the same moment: one of them wins)
+            if [ -d "$APP_DIR/live-on.lock" ] && [ $(( $(date +%s) - $(mtime "$APP_DIR/live-on.lock") )) -gt 60 ]; then rmdir "$APP_DIR/live-on.lock" 2>/dev/null; fi
+            if mkdir "$APP_DIR/live-on.lock" 2>/dev/null; then
+                if [ ! -f "$APP_DIR/live-on" ]; then
+                    echo "$on" > "$APP_DIR/live-on"; log "Live started (file \"$on\")."; touch "$APP_DIR/status-due"
+                    ask_presenters "$on"
+                fi
+                rmdir "$APP_DIR/live-on.lock" 2>/dev/null
+            fi
         fi
         return 0
     fi
@@ -954,6 +1104,31 @@ recording_now() {   # is a live on? LIVE Studio has a recording open, or a recor
         keep_open_note
     fi
     return 1
+}
+# The live watcher: between the minute's runs, it looks every few seconds for LIVE Studio starting to record, so
+# "Clock in" shows within seconds of going live, not up to a minute later (Brandon, 24 Nov). Only while nothing is
+# known to be live and there are names to ask; each run starts it afresh (so it always has this run's settings).
+LIVE_WATCH_EVERY="${SALSABEEL_UPLOADER_WATCH_EVERY:-3}"
+live_watch() {
+    local i=0
+    while [ "$i" -lt $(( 54 / LIVE_WATCH_EVERY )) ]; do
+        if [ -f "$APP_DIR/live-on" ]; then break; fi
+        if [ -n "$(live_studio_videos | head -n 1)" ]; then recording_now >/dev/null 2>&1; break; fi
+        sleep "$LIVE_WATCH_EVERY"; i=$((i + 1))
+    done
+    rm -f "$APP_DIR/live-watch.pid"
+}
+start_live_watch() {
+    local old
+    old=$(cat "$APP_DIR/live-watch.pid" 2>/dev/null)
+    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then kill "$old" 2>/dev/null; fi   # only the watcher, never a "Clock in" window
+    rm -f "$APP_DIR/live-watch.pid"
+    [ -z "${SALSABEEL_UPLOADER_NO_WATCH:-}" ] || return 0   # (the self-test, except where it tests this)
+    [ "$PRESENTERS_ASK" = on ] && [ ! -f "$APP_DIR/live-on" ] && [ -n "$(presenter_names | head -n 1)" ] || return 0
+    set -m   # its own process group, so it outlives this run
+    live_watch </dev/null >/dev/null 2>&1 &
+    echo $! > "$APP_DIR/live-watch.pid"
+    set +m
 }
 follow_live_studio() {   # video files LIVE Studio has open outside the recording folder
     local p
@@ -1115,6 +1290,7 @@ empty_bin() {   # [now]: once an hour (and straight after Drive reads full), del
     return 0
 }
 
+if [ "${1:-}" = --clock-in-helper ]; then clock_in_helper; exit 0; fi
 follow_live_studio
 while IFS= read -r f; do take_if_finished "$f" since; done < <(recordings)
 if [ -s "$FOLLOW" ]; then
@@ -1128,6 +1304,8 @@ fi
 clear_copied   # first: it frees space for the Drive check below
 empty_bin
 read_presenters
+start_live_watch
+ensure_helper
 rescue_moved
 
 pending() { find "$READY" -type f ! -name '.*' 2>/dev/null; }
@@ -1313,6 +1491,7 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
         PREV_RUN=$last_tick; echo "$waiting" > "$APP_DIR/waiting-count"; note_sleep
     fi
     last_tick=$now_s; touch "$APP_DIR/last-run"   # (launchd starts no other run while this one goes on)
+    if [ $((ticks % 15)) -eq 0 ]; then start_live_watch; fi   # so a live starting mid-upload is seen within seconds
     if [ $((ticks % 15)) -eq 0 ]; then   # a new version is installed now, and takes over after the upload ...
         UPDATED=""
         update_if_due
