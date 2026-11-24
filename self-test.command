@@ -777,7 +777,7 @@ start_live; : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
 for i in $(seq 1 10); do ls "$ROOT/app/presenters/"*.names >/dev/null 2>&1 && break; sleep 1; done
 bash "$ROOT/app/upload-lives.sh"
 check "a live starts: \"Who are you?\" shows the names from Drive, once" \
-      '[ "$(cat "$ROOT/asked")" = "Alice Bea Cara" ] && grep -q "Asked \"Who are you?\"" "$ROOT/test.log"'
+      '[ "$(cat "$ROOT/asked")" = "Alice Bea Cara" ] && grep -q "Asked \"Clock in\"" "$ROOT/test.log"'
 check "the answer is kept on the Mac until the recording has its name" \
       '[ "$(cat "$ROOT/app/presenters/"*.names)" = Bea ] && grep -q "on this live: Bea (clicked)" "$ROOT/test.log"'
 check "the note says the live is on, and who clicked, at once (for the live screen)" \
@@ -954,9 +954,9 @@ env -u SALSABEEL_UPLOADER_NO_WATCH SALSABEEL_UPLOADER_WATCH_EVERY=1 SALSABEEL_UP
     SALSABEEL_UPLOADER_CHIME="$ROOT/fake-chime" SALSABEEL_UPLOADER_CHIME_EVERY=2 bash "$ROOT/app/upload-lives.sh"
 check "no live yet: the live watcher is waiting in the background" '[ -s "$ROOT/app/live-watch.pid" ] && kill -0 "$(cat "$ROOT/app/live-watch.pid")" 2>/dev/null'
 start_live; t0=$(date +%s)
-for i in $(seq 1 15); do grep -q "Asked \"Who are you?\"" "$ROOT/test.log" && break; sleep 1; done; seen=$(( $(date +%s) - t0 ))
+for i in $(seq 1 15); do grep -q "Asked \"Clock in\"" "$ROOT/test.log" && break; sleep 1; done; seen=$(( $(date +%s) - t0 ))
 check "a live starts between runs: \"Clock in\" shows within seconds ($seen s), without waiting for the next minute" \
-      'grep -q "Live started" "$ROOT/test.log" && grep -q "Asked \"Who are you?\"" "$ROOT/test.log" && [ "$seen" -le 5 ]'
+      'grep -q "Live started" "$ROOT/test.log" && grep -q "Asked \"Clock in\"" "$ROOT/test.log" && [ "$seen" -le 5 ]'
 for i in $(seq 1 15); do grep -q "(clicked)" "$ROOT/test.log" && break; sleep 1; done
 n_at_tap=$(grep -c . "$ROOT/chimes" 2>/dev/null || echo 0); sleep 5; n_after=$(grep -c . "$ROOT/chimes" 2>/dev/null || echo 0)
 check "a chime as it shows and again until a name is tapped ($n_at_tap), then no more ($n_after)" \
@@ -974,7 +974,8 @@ cat > "$ROOT/fake-standby" <<EOF
 # A pretend window: "loads", waits hidden for the trigger, then "shows" (the time, in ms) and a name is tapped
 t=\$1; shift; sleep 1; echo ready > "\$t.ready"
 while [ ! -e "\$t" ]; do sleep 0.05; done
-python3 -c 'import time; print(int(time.time()*1000))' > "$ROOT/shown-at"; echo "\$*" > "$ROOT/standby-names"
+echo "\$*" > "$ROOT/standby-names"; python3 -c 'import time; print(int(time.time()*1000))' > "$ROOT/shown-at.tmp"; mv "$ROOT/shown-at.tmp" "$ROOT/shown-at"
+echo "screens=2 visible=0 front=TikTok LIVE Studio" > "\$(dirname "\$t")/shown.txt"
 sleep 1; echo "\$1"; sleep 3
 EOF
 chmod +x "$ROOT/fake-standby"; rm -f "$ROOT/shown-at" "$ROOT/chimes"; : > "$ROOT/test.log"
@@ -997,6 +998,8 @@ shown_ms=$(( $(cat "$ROOT/shown-at" 2>/dev/null || echo 99999999999999) - made )
 check "offline, uploader not running: a recording appears and \"Clock in\" shows in $shown_ms ms (under 1 second), with the names" \
       '[ "$shown_ms" -ge 0 ] && [ "$shown_ms" -lt 1000 ] && [ "$(cat "$ROOT/standby-names")" = "Alice Bea Cara" ] && grep -q "Live started (file \"$REC/fresh live.mp4\")" "$ROOT/test.log"'
 for i in $(seq 1 20); do grep -q "(clicked)" "$ROOT/test.log" && break; sleep 0.5; done
+check "... the log says whether it really showed (here: covered on both screens, LIVE Studio in front)" \
+      'grep -q "\"Clock in\" is NOT visible: macOS says it is covered on all 2 screens (in front: TikTok LIVE Studio)" "$ROOT/test.log"'
 check "... the name tapped on it is saved on this Mac with the time, the chime played, and nothing went online" \
       'grep -q "Alice.*(clicked)" "$ROOT/test.log" && grep -qx Alice "$ROOT/app/presenters/"*.names && [ -s "$ROOT/app/presenters/"*.at ] && [ -s "$ROOT/chimes" ] && [ ! -e "$ROOT/offline-calls" ]'
 ago "$REC/fresh live.mp4" 10; rm -f "$ROOT/app/live-on" "$ROOT/shown-at"
