@@ -1401,6 +1401,7 @@ if [ "$count" -eq 0 ]; then
 fi
 rm -f "$APP_DIR/full-noted"
 PROGRESS="$APP_DIR/upload-progress.log"
+short_urls() { sed -E 's#(https?://[^?" ]*)\?[^" ]*#\1#g'; }   # a web address's long tail cut off, so the reason fits in the note
 : > "$PROGRESS"
 SRC="$READY/$(head -n 1 "$APP_DIR/to-upload")"; PARTS=""
 if [ "$PARTS_UPLOAD" = on ] && [ "$(dirname "$(head -n 1 "$APP_DIR/to-upload")")" = . ] &&
@@ -1577,7 +1578,7 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
         fi
     fi
     if [ -z "$err_logged" ] && grep -qE 'ERROR|low level retry' "$PROGRESS" 2>/dev/null; then   # seen as it happens, not hours later
-        err_logged=1; log "rclone says (it keeps trying): $(grep -m 1 -E 'ERROR|low level retry' "$PROGRESS" | cut -c1-300)"
+        err_logged=1; log "rclone says (it keeps trying): $(grep -m 1 -E 'ERROR|low level retry' "$PROGRESS" | short_urls | cut -c1-300)"
     fi
     line=$(grep -E ' / .*[0-9]+%' "$PROGRESS" 2>/dev/null | tail -n 1)
     if [ -z "$held" ] && [ -n "$line" ]; then
@@ -1652,8 +1653,8 @@ elif [ -n "$ok" ]; then
     if [ "$mode" = live ] && [ "$left" -gt 0 ]; then NOW_LINE="A live is on: $(plural "$left" "upload waits" "uploads wait"), the next goes slowly in a minute"
     elif [ "$left" -gt 0 ]; then NOW_LINE="Uploaded one: $(plural "$left" "live waits" "lives wait"), the next starts within a minute"; fi
 else
-    { grep -m 2 -E 'ERROR|low level retry|Failed to' "$PROGRESS" | cut -c1-300   # the head of rclone's error (what failed, and why) ...
-      grep -vE ' / .*[0-9]+%' "$PROGRESS" | tail -n 5; } >> "$LOG"           # ... and its end
+    { grep -m 2 -E 'ERROR|low level retry|Failed to' "$PROGRESS" | short_urls | cut -c1-300   # the head of rclone's error (what failed, and why) ...
+      grep -vE ' / .*[0-9]+%' "$PROGRESS" | tail -n 5 | short_urls; } >> "$LOG"           # ... and its end
     if grep -qiE 'storageQuotaExceeded|quota has been exceeded|quotaExceeded' "$PROGRESS"; then
         log "Google Drive is full: it stays in \"Ready to upload\" and is tried again in a minute."
         status_full
