@@ -272,16 +272,32 @@ function run(argv) {
     var ev = app.nextEventMatchingMaskUntilDateInModeDequeue($.NSEventMaskAny, $.NSDate.dateWithTimeIntervalSinceNow(seconds), $.NSDefaultRunLoopMode, true);
     if (ev && !ev.isNil()) app.sendEvent(ev);
   }
-  var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, W, H), 1 | 2, 2, false);
-  win.title = "Salsabeel"; win.releasedWhenClosed = false; win.delegate = $.SalsabeelWho.alloc.init;
-  win.level = 1000;               // above every other window, menus and the Dock (the screen saver level)
-  win.collectionBehavior = 1 | 16 | 256;   // every Space, stays put, and over full-screen apps (like LIVE Studio)
-  win.backgroundColor = $.NSColor.colorWithSRGBRedGreenBlueAlpha(14 / 255, 14 / 255, 16 / 255, 1);
-  var wv = $.WKWebView.alloc.initWithFrameConfiguration($.NSMakeRect(0, 0, W, H), $.WKWebViewConfiguration.alloc.init);
-  win.contentView = wv;
-  var url = $.NSURL.fileURLWithPath(page);
-  wv.loadFileURLAllowingReadAccessToURL(url, url.URLByDeletingLastPathComponent);
-  function title() { var t = wv.title; return (t && !t.isNil()) ? ObjC.unwrap(t) : ""; }
+  // One window on every screen (an external monitor may be the one they look at); a tap on any of them counts
+  var screens = $.NSScreen.screens, nScreens = Number(screens.count), wins = [], wvs = [];
+  var url = $.NSURL.fileURLWithPath(page), info = page.replace(/[^\/]*$/, "") + "shown.txt";
+  for (var i = 0; i < Math.max(1, nScreens); i++) {
+    var w1 = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, W, H), 1 | 2, 2, false);
+    w1.title = "Salsabeel"; w1.releasedWhenClosed = false; w1.delegate = $.SalsabeelWho.alloc.init;
+    w1.level = 1000;               // above every other window, menus and the Dock (the screen saver level)
+    w1.collectionBehavior = 1 | 16 | 256;   // every Space, stays put, and over full-screen apps (like LIVE Studio)
+    w1.backgroundColor = $.NSColor.colorWithSRGBRedGreenBlueAlpha(14 / 255, 14 / 255, 16 / 255, 1);
+    var v1 = $.WKWebView.alloc.initWithFrameConfiguration($.NSMakeRect(0, 0, W, H), $.WKWebViewConfiguration.alloc.init);
+    w1.contentView = v1;
+    v1.loadFileURLAllowingReadAccessToURL(url, url.URLByDeletingLastPathComponent);
+    wins.push(w1); wvs.push(v1);
+  }
+  var win = wins[0], wv = wvs[0];
+  function titleOf(v) { var t = v.title; return (t && !t.isNil()) ? ObjC.unwrap(t) : ""; }
+  function title() {   // the one that was tapped, if any (then that is the one that shows the thank-you)
+    for (var j = 0; j < wvs.length; j++) { var tj = titleOf(wvs[j]); if (tj.indexOf("picked:") === 0) { win = wins[j]; wv = wvs[j]; return tj; } }
+    return titleOf(wvs[0]);
+  }
+  function report() {   // (for the log: did it really show, where, and what was in front)
+    var vis = 0, front = "";
+    for (var j = 0; j < wins.length; j++) { if (wins[j].isVisible && (Number(wins[j].occlusionState) & 2)) vis++; }
+    try { front = ObjC.unwrap($.NSWorkspace.sharedWorkspace.frontmostApplication.localizedName) || ""; } catch (e) {}
+    $("screens=" + nScreens + " visible=" + vis + " front=" + front + "\n").writeToFileAtomicallyEncodingError(info, true, 4, $());
+  }
   function snap(name) {   // (a check on a Mac: a picture of the window)
     if (!testSnap || snapped[name]) return;
     snapped[name] = true;
@@ -291,20 +307,25 @@ function run(argv) {
       });
     } catch (e) { $(String(e)).writeToFileAtomicallyEncodingError(testSnap + "/" + name + ".err", true, 4, $()); }
   }
-  var t0 = Date.now(), ready = false;
+  var t0 = Date.now(), ready = false, reported = false;
   while (!picked && !closed && (!shown || Date.now() - shown < 900000)) {   // the shell closes it sooner (10 minutes)
     pump(shown || !trigger ? 0.1 : 0.05);
     var t = title();
-    if (!ready && t.indexOf("Salsabeel") === 0) {
+    if (!ready && wvs.every(function (v) { return titleOf(v).indexOf("Salsabeel") === 0; })) {
       ready = true;
       if (trigger) $("ready").writeToFileAtomicallyEncodingError(trigger + ".ready", true, 4, $());
     }
-    if (!shown && ready && (!trigger || fm.fileExistsAtPath(trigger))) {   // centred on the main screen, in front of everything
-      var sf = $.NSScreen.mainScreen.frame;
-      win.setFrameOrigin($.NSMakePoint(sf.origin.x + (sf.size.width - W) / 2, sf.origin.y + (sf.size.height - H) / 2));
-      app.activateIgnoringOtherApps(true); win.makeKeyAndOrderFront(null); win.orderFrontRegardless;
+    if (!shown && ready && (!trigger || fm.fileExistsAtPath(trigger))) {   // centred on every screen, in front of everything
+      app.activateIgnoringOtherApps(true);
+      for (var k = 0; k < wins.length; k++) {
+        var sf = (k < nScreens ? screens.objectAtIndex(k) : $.NSScreen.mainScreen).frame;
+        wins[k].setFrameOrigin($.NSMakePoint(sf.origin.x + (sf.size.width - W) / 2, sf.origin.y + (sf.size.height - H) / 2));
+        wins[k].makeKeyAndOrderFront(null); wins[k].orderFrontRegardless;
+      }
+      wins[0].makeKeyWindow;
       shown = Date.now();
     }
+    if (shown && !reported && Date.now() - shown > 1500) { reported = true; try { report(); } catch (e) {} }
     if (!ready && Date.now() - t0 > 10000) throw new Error("the page did not open");
     if (shown && testSnap && !snapped["shown"]) {   // (a check: how fast it showed)
       snapped["shown"] = true; $(String(Date.now())).writeToFileAtomicallyEncodingError(testSnap + "/shown-at", true, 4, $());
@@ -314,6 +335,7 @@ function run(argv) {
   }
   if (picked) {
     $.NSFileHandle.fileHandleWithStandardOutput.writeData($(picked + "\n").dataUsingEncoding(4));   // the name, first
+    wins.forEach(function (w) { if (w !== win) w.orderOut(null); });   // only the tapped one says thank you
     try {
       var end = Date.now() + 3000;
       while (Date.now() < end && !closed) {   // the thank-you, for a fixed 3 seconds, still answering
@@ -322,7 +344,7 @@ function run(argv) {
       }
     } catch (e) {}
   }
-  win.orderOut(null);
+  wins.forEach(function (w) { w.orderOut(null); });
   return "";
 }'
 who_window() {   # names...: the window (the page is made first; no page, no window: the plain list is used)
@@ -888,13 +910,24 @@ chime() {   # a short, soft sound so they look at the screen ("Clock in" is wait
     elif command -v afplay >/dev/null 2>&1; then afplay -v "$PRESENTERS_CHIME_VOLUME" "$PRESENTERS_CHIME_SOUND" >/dev/null 2>&1 &
     fi
 }   # once a name is in, the window gets this long to say thanks and close
+shown_note() {   # the window's own report (a second after it shows): did it really show, on how many screens, what was in front
+    local sc vis fr
+    if [ ! -s "$1" ]; then log "\"Clock in\": the window did not say whether it is on screen."; return 0; fi
+    sc=$(sed -n 's/.*screens=\([0-9]*\).*/\1/p' "$1"); vis=$(sed -n 's/.*visible=\([0-9]*\).*/\1/p' "$1"); fr=$(sed -n 's/.*front=//p' "$1" | head -n 1)
+    if [ "${vis:-0}" -gt 0 ]; then
+        log "\"Clock in\" is on screen: visible on $vis of $(plural "${sc:-1}" screen screens) (in front: ${fr:-?})."
+    else
+        log "\"Clock in\" is NOT visible: macOS says it is covered on all $(plural "${sc:-1}" screen screens) (in front: ${fr:-?})."
+    fi
+}
 ask_window() {   # base names...: on this Mac's screen; the name clicked goes to base.names (none if closed or left)
-    local base=$1 pid t=0 st=0 how=window saved="" limit ans adopted=""
+    local base=$1 pid t=0 st=0 how=window saved="" limit ans adopted="" info="$APP_DIR/shown.txt" told=""
     shift
     ans="$base.answer"
     if [ -n "${ADOPT_STANDBY:-}" ] && standby_ready; then   # the window is loaded and waiting: show it now
+        info="$STANDBY/shown.txt"; rm -f "$info"
         touch "$STANDBY/trigger"; pid=$(cat "$STANDBY/pid"); ans="$STANDBY/out"; adopted=1
-    elif [ -n "$ASK" ]; then "$ASK" "$@" > "$ans" 2>/dev/null & pid=$!
+    elif rm -f "$info" && [ -n "$ASK" ]; then "$ASK" "$@" > "$ans" 2>/dev/null & pid=$!
     else who_window "$@" > "$ans" 2>/dev/null & pid=$!
     fi
     while :; do
@@ -902,6 +935,7 @@ ask_window() {   # base names...: on this Mac's screen; the name clicked goes to
         while kill -0 "$pid" 2>/dev/null && [ "$t" -lt "$limit" ]; do
             if [ -z "$saved" ] && [ $(( t % PRESENTERS_CHIME_EVERY )) -eq 1 ]; then chime; fi   # as it shows, then every minute
             sleep 1; t=$((t + 1))
+            if [ -z "$told" ] && [ "$how" = window ] && { [ -s "$info" ] || [ "$t" -ge 6 ]; }; then told=1; shown_note "$info"; fi
             if [ -z "$saved" ] && got_name "$base" "$ans"; then saved=1; limit=$(( t + THANKS_MAX )); fi
         done
         if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; st=timeout
@@ -1032,7 +1066,7 @@ ensure_helper() {   # the helper's background job: written and started once (and
     fi
 }
 ask_presenters() {   # a live has started (the file it records to): ask "Who are you?", once per recording
-    local s id n names=()
+    local s id n how names=()
     [ "$PRESENTERS_ASK" = on ] || return 0
     for s in "$PRES"/*.src; do if [ "$(cat "$s")" = "$1" ]; then return 0; fi; done   # (asked already)
     while IFS= read -r n; do names+=("$n"); done < <(presenter_names)
@@ -1042,10 +1076,11 @@ ask_presenters() {   # a live has started (the file it records to): ask "Who are
     printf '%s\n' "$1" > "$PRES/$id.src"
     # In the background, in its own process group, so it never holds anything up and outlives this run
     # (launchd ends whatever is left in a run's group when the run ends).
+    if standby_ready; then how="shown at once: it was ready"; else how="opened fresh"; fi
     set -m
     ADOPT_STANDBY=1 ask_window "$PRES/$id" "${names[@]}" </dev/null >/dev/null 2>&1 &
     set +m
-    log "Asked \"Who are you?\" on this Mac's screen ($(plural "${#names[@]}" name names); it closes by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes))."
+    log "Asked \"Clock in\" ($how) on this Mac's screen ($(plural "${#names[@]}" name names); it closes by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes))."
 }
 presenters_named() {   # recording-path new-path [short]: the answer belongs to this name in Drive
     local s
