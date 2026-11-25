@@ -502,6 +502,7 @@ send_status() {
         fi
         echo "Line:               $(line_report)"
         echo "LIVE Studio sound:  $(live_studio_sound)"
+        if [ "$PRESENTERS_ASK" = on ] && [ -n "$(presenter_names | head -n 1)" ]; then echo "Clock in:           $(standby_note)"; fi
         if own_app_keys; then   # our own Google app: switched yet?
             if on_own_app; then echo "Google app:         Salsabeel's own (switched)"
             elif [ -f "$APP_DIR/signin-asked" ]; then echo "Google app:         rclone's shared one; sign-in last asked $(clock_of "$(mtime "$APP_DIR/signin-asked")" '%d %b %H:%M')"
@@ -776,19 +777,19 @@ note_sleep() {   # the Mac slept (or was off) between runs while lives were wait
 }
 clock_of() { if [ "$(uname)" = "Darwin" ]; then date -r "$1" "+$2"; else date -d "@$1" "+$2"; fi; }
 if [ "${1:-}" = "--live-ceiling" ]; then mbit_of "$(ceiling_kbit)"; exit 0; fi   # (for the self-test)
-if [ "${1:-}" = "--status-now" ]; then send_status; exit $?; fi
-note_sleep
+STATUS_ONLY=""; if [ "${1:-}" = "--status-now" ]; then STATUS_ONLY=1; fi   # (sent below, once every part of the note is defined)
+if [ -z "$STATUS_ONLY" ]; then note_sleep; fi
 
 # One copy at a time (launchd already avoids overlaps; this covers a manual run as well).
 PIDFILE="$APP_DIR/running.pid"
-if [ "${1:-}" != --clock-in-helper ]; then   # (the "Clock in" helper runs alongside, below)
+if [ "${1:-}" != --clock-in-helper ] && [ -z "$STATUS_ONLY" ]; then   # (the "Clock in" helper runs alongside, below)
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then exit 0; fi
     echo $$ > "$PIDFILE"
     trap 'rm -f "$PIDFILE"' EXIT
 fi
 # "Fix Salsabeel uploader" is switching the Google sign-in: start nothing until it's done (at most 30 minutes)
 HELPER_RUN=""; if [ "${1:-}" = --clock-in-helper ]; then HELPER_RUN=1; fi
-if [ -z "$HELPER_RUN" ]; then
+if [ -z "$HELPER_RUN" ] && [ -z "$STATUS_ONLY" ]; then
     if [ -f "$APP_DIR/fixer-hold" ] && [ $(( $(date +%s) - $(mtime "$APP_DIR/fixer-hold") )) -lt 1800 ]; then exit 0; fi
     update_if_due   # (only the uploader updates; the helper picks the new version up when it next starts)
 fi
@@ -917,7 +918,7 @@ chime() {   # a short, soft sound so they look at the screen ("Clock in" is wait
 }   # once a name is in, the window gets this long to say thanks and close
 shown_note() {   # the window's own report (a second after it shows): did it really show, on how many screens, what was in front
     local sc vis fr
-    if [ ! -s "$1" ]; then log "\"Clock in\": the window did not say whether it is on screen."; return 0; fi
+    if [ ! -s "$1" ]; then log "\"Clock in\": the window did not say whether it is on screen (waited ${2:-?} s)."; return 0; fi
     sc=$(sed -n 's/.*screens=\([0-9]*\).*/\1/p' "$1"); vis=$(sed -n 's/.*visible=\([0-9]*\).*/\1/p' "$1"); fr=$(sed -n 's/.*front=//p' "$1" | head -n 1)
     if [ "${vis:-0}" -gt 0 ]; then
         log "\"Clock in\" is on screen: visible on $vis of $(plural "${sc:-1}" screen screens) (in front: ${fr:-?})."
@@ -926,12 +927,12 @@ shown_note() {   # the window's own report (a second after it shows): did it rea
     fi
 }
 ask_window() {   # base names...: on this Mac's screen; the name clicked goes to base.names (none if closed or left)
-    local base=$1 pid t=0 st=0 how=window saved="" limit ans adopted="" info="$APP_DIR/shown.txt" told=""
+    local base=$1 pid t=0 st=0 how=window saved="" limit ans adopted="" info="$APP_DIR/shown.txt" told="" wait_note=25
     shift
     ans="$base.answer"
     if [ -n "${ADOPT_STANDBY:-}" ] && standby_ready; then   # the window is loaded and waiting: show it now
         info="$STANDBY/shown.txt"; rm -f "$info"
-        touch "$STANDBY/trigger"; pid=$(cat "$STANDBY/pid"); ans="$STANDBY/out"; adopted=1
+        touch "$STANDBY/trigger"; pid=$(cat "$STANDBY/pid"); ans="$STANDBY/out"; adopted=1; wait_note=6
     elif rm -f "$info" && [ -n "$ASK" ]; then "$ASK" "$@" > "$ans" 2>/dev/null & pid=$!
     else who_window "$@" > "$ans" 2>/dev/null & pid=$!
     fi
@@ -940,7 +941,7 @@ ask_window() {   # base names...: on this Mac's screen; the name clicked goes to
         while kill -0 "$pid" 2>/dev/null && [ "$t" -lt "$limit" ]; do
             if [ -z "$saved" ] && [ $(( t % PRESENTERS_CHIME_EVERY )) -eq 1 ]; then chime; fi   # as it shows, then every minute
             sleep 1; t=$((t + 1))
-            if [ -z "$told" ] && [ "$how" = window ] && { [ -s "$info" ] || [ "$t" -ge 6 ]; }; then told=1; shown_note "$info"; fi
+            if [ -z "$told" ] && [ "$how" = window ] && { [ -s "$info" ] || [ "$t" -ge "$wait_note" ]; }; then told=1; shown_note "$info" "$t"; fi
             if [ -z "$saved" ] && got_name "$base" "$ans"; then saved=1; limit=$(( t + THANKS_MAX )); fi
         done
         if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; st=timeout
@@ -948,7 +949,7 @@ ask_window() {   # base names...: on this Mac's screen; the name clicked goes to
         else wait "$pid"; st=$?; fi
         if [ -z "$saved" ] && got_name "$base" "$ans"; then saved=1; fi
         if [ -n "$saved" ] || [ "$st" = 0 ] || [ "$st" = timeout ] || [ "$how" = list ] || [ "$t" -gt 15 ]; then break; fi
-        log "The \"Who are you?\" window would not open (error $st), so it asks with a plain list instead."
+        log "The \"Clock in\" window would not open (error $st), so it asks with a plain list instead."
         how=list; adopted=""; ans="$base.answer"
         if [ -n "${SALSABEEL_UPLOADER_ASK2:-}" ]; then "$SALSABEEL_UPLOADER_ASK2" "$@" > "$ans" 2>/dev/null &
         else who_list "$@" > "$ans" 2>/dev/null & fi
@@ -959,9 +960,9 @@ ask_window() {   # base names...: on this Mac's screen; the name clicked goes to
     if [ -n "$saved" ]; then
         if [ "$how" = list ] && [ -f "$base.names" ]; then thanks_note "$(head -n 1 "$base.names")"; fi
     elif [ "$st" = timeout ]; then
-        log "Nobody answered \"Who are you?\", so it closed by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes)."
+        log "Nobody answered \"Clock in\", so it closed by itself after $(plural $(( (PRESENTERS_WAIT + 59) / 60 )) minute minutes)."
     else
-        log "\"Who are you?\" was closed without a name."
+        log "\"Clock in\" was closed without a name."
     fi
 }
 # Our own Google app for rclone (no more sharing rclone's built-in one). The cloud fills "Mac Google app.txt" in Drive
@@ -995,6 +996,24 @@ STANDBY="$APP_DIR/standby"
 standby_ready() {   # loaded, hidden and not yet shown
     [ -s "$STANDBY/pid" ] && kill -0 "$(cat "$STANDBY/pid")" 2>/dev/null && [ -f "$STANDBY/trigger.ready" ] && [ ! -e "$STANDBY/trigger" ]
 }
+standby_why() {   # why no loaded window was ready (for the log and the note)
+    local e
+    if [ ! -f "$STANDBY/alive" ] || [ $(( $(date +%s) - $(mtime "$STANDBY/alive") )) -gt 10 ]; then echo "the \"Clock in\" helper is not running"
+    elif [ -e "$STANDBY/trigger" ]; then echo "the loaded window was still in use"
+    elif [ ! -s "$STANDBY/pid" ]; then echo "no window was loaded"
+    elif ! kill -0 "$(cat "$STANDBY/pid")" 2>/dev/null; then
+        e=$(grep -v '^[[:space:]]*$' "$STANDBY/err" 2>/dev/null | tail -n 1 | cut -c1-160)
+        echo "the loaded window had quit${e:+ (\"$e\")}"
+    elif [ ! -f "$STANDBY/trigger.ready" ]; then echo "the loaded window had not finished loading ($(( $(date +%s) - $(mtime "$STANDBY/pid") )) s after it started)"
+    else echo "unknown"; fi
+}
+standby_note() {   # the note's line: is the helper running and a window loaded, and how often it has had to reload
+    local now n=0 x
+    now=$(date +%s)
+    while IFS= read -r x; do if [ $(( now - ${x:-0} )) -lt 86400 ] 2>/dev/null; then n=$((n + 1)); fi; done 2>/dev/null < "$STANDBY/starts"
+    if standby_ready; then printf 'helper running, window loaded and ready'; else printf 'not ready: %s' "$(standby_why)"; fi
+    printf '; window loaded %s in the last 24 hours\n' "$(plural "$n" time times)"
+}
 standby_stop() {
     if [ -s "$STANDBY/pid" ]; then kill "$(cat "$STANDBY/pid")" 2>/dev/null; fi
     rm -f "$STANDBY/pid" "$STANDBY/out" "$STANDBY/trigger" "$STANDBY/trigger.ready" "$STANDBY/names"
@@ -1011,9 +1030,10 @@ standby_start() {   # a window, loaded and hidden, for the names in Drive now
     else
         who_page "${names[@]}" && cp -f "$APP_DIR/who.html" "$STANDBY/who.html" &&
             osascript -l JavaScript -e "$WHO_WINDOW" "$STANDBY/who.html" "$WHO_W" "$WHO_H" "$STANDBY/trigger" \
-                > "$STANDBY/out" 2>/dev/null </dev/null &
+                > "$STANDBY/out" 2> "$STANDBY/err" </dev/null &
     fi
     echo $! > "$STANDBY/pid"
+    { tail -n 199 "$STANDBY/starts" 2>/dev/null; date +%s; } > "$STANDBY/starts.tmp" && mv -f "$STANDBY/starts.tmp" "$STANDBY/starts"
     set +m
 }
 clock_in_helper() {   # the helper's loop (an hour at a time; launchd starts it again, with any new version)
@@ -1022,6 +1042,7 @@ clock_in_helper() {   # the helper's loop (an hour at a time; launchd starts it 
     mkdir -p "$STANDBY"; touch "$STANDBY/mark"
     while [ "$(date +%s)" -lt "$end" ]; do
         n=$((n + 1))
+        if [ $(( n % 4 )) = 1 ]; then touch "$STANDBY/alive"; fi   # (so the log can tell if the helper is running)
         if [ "$PRESENTERS_ASK" = on ] && [ ! -f "$APP_DIR/live-on" ] && [ -n "$(presenter_names | head -n 1)" ]; then
             if ! standby_ready && { [ ! -s "$STANDBY/pid" ] || ! kill -0 "$(cat "$STANDBY/pid")" 2>/dev/null ||
                                     ! presenter_names | cmp -s - "$STANDBY/names"; }; then
@@ -1081,7 +1102,7 @@ ask_presenters() {   # a live has started (the file it records to): ask "Who are
     printf '%s\n' "$1" > "$PRES/$id.src"
     # In the background, in its own process group, so it never holds anything up and outlives this run
     # (launchd ends whatever is left in a run's group when the run ends).
-    if standby_ready; then how="shown at once: it was ready"; else how="opened fresh"; fi
+    if standby_ready; then how="shown at once: it was ready"; else how="opened fresh, because $(standby_why)"; fi
     set -m
     ADOPT_STANDBY=1 ask_window "$PRES/$id" "${names[@]}" </dev/null >/dev/null 2>&1 &
     set +m
@@ -1479,6 +1500,7 @@ maybe_ask_signin() {   # once the keys are here and it isn't switched yet: ask (
     echo $! > "$APP_DIR/signin.pid"
     set +m
 }
+if [ -n "$STATUS_ONLY" ]; then send_status; exit $?; fi
 if [ "${1:-}" = --signin-window ]; then signin_window "${2:-ask}"; exit 0; fi   # (a check: the window on its own)
 if [ "${1:-}" = --clock-in-helper ]; then clock_in_helper; exit 0; fi
 follow_live_studio
