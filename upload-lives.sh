@@ -502,6 +502,11 @@ send_status() {
         fi
         echo "Line:               $(line_report)"
         echo "LIVE Studio sound:  $(live_studio_sound)"
+        if own_app_keys; then   # our own Google app: switched yet?
+            if on_own_app; then echo "Google app:         Salsabeel's own (switched)"
+            elif [ -f "$APP_DIR/signin-asked" ]; then echo "Google app:         rclone's shared one; sign-in last asked $(clock_of "$(mtime "$APP_DIR/signin-asked")" '%d %b %H:%M')"
+            else echo "Google app:         rclone's shared one; sign-in not asked yet"; fi
+        fi
         echo "Mac:                $mac"
         echo "Version:            $(cat "$APP_DIR/VERSION" 2>/dev/null || echo unknown)"
         echo "Recording folder:   $WATCH_DIR"
@@ -971,7 +976,7 @@ read_google_app() {   # the "Uploader checks" listing
         if [ "$(grep -c . "$f.new" 2>/dev/null)" = 2 ] && ! cmp -s "$f.new" "$f"; then
             mv -f "$f.new" "$f"; chmod 600 "$f"
             if [ -d "$BACKUP" ]; then cp -p "$f" "$BACKUP/google-app" 2>/dev/null; fi
-            log "Our own Google app is ready (from Drive). Running \"Fix Salsabeel uploader\" once switches the sign-in to it."
+            log "Our own Google app is ready (from Drive). A window on this Mac asks for the Google sign-in through it (never during a live)."
         else
             rm -f "$f.new"
         fi
@@ -1325,6 +1330,156 @@ empty_bin() {   # [now]: once an hour (and straight after Drive reads full), del
     return 0
 }
 
+# --- Google sign-in window (Brandon, 25 Nov: "can this prompt for the login pop up multiple times if no one is filling
+# it in ... tell he win a window to login or it won't get done") ---------------------------------------------------
+# Once our own Google app's keys are on this Mac (from "Mac Google app.txt"), the uploader asks, in a window like
+# "Clock in", for one Google sign-in through it. Never during a live; again every 2 hours (and when the Mac wakes)
+# until it is done. The sign-in goes into a config file of its own, so the old sign-in keeps every upload going;
+# only once it is checked (it can see this Mac's own status note in Drive) does it replace the old one, between
+# uploads, and if that check fails the old one is put straight back. Then "All set, thank you" and never again.
+SIGNIN_EVERY="${SALSABEEL_UPLOADER_SIGNIN_EVERY:-7200}"
+SIGNIN_WAIT="${SALSABEEL_UPLOADER_SIGNIN_WAIT:-600}"
+SIGNIN_REMOTE="salsabeel-own-app"
+STATUS_NAME="Mac status.txt"
+app_key() { sed -n "s/^$1=//p" "$APP_DIR/google-app" 2>/dev/null | head -n 1; }
+own_app_keys() { [ -n "$(app_key client_id)" ] && [ -n "$(app_key client_secret)" ]; }
+conf_client() {   # file remote: that remote's client_id in an rclone config file
+    awk -v r="[$2]" '$0 == r { s = 1; next } /^\[/ { s = 0 } s && /^client_id *=/ { sub(/^client_id *= */, ""); print; exit }' "$1" 2>/dev/null
+}
+on_own_app() { [ "$(conf_client "$(rclone_conf)" "$REMOTE")" = "$(app_key client_id)" ]; }
+signin_page() {   # kind (ask|done|blocked|failed): writes $APP_DIR/signin.html in the "Clock in" look
+    local f="$APP_DIR/signin.html" state h1 sub body buttons after
+    [ -f "$TEMPLATE" ] && grep -q 'class="brand"' "$TEMPLATE" || return 1
+    case "$1" in
+        ask) state="Action needed"; h1="Google sign-in needed"; sub="To keep the lives uploading to Google Drive. It takes a minute."
+             body='<ol class="steps"><li>Tap <b>Sign in</b>. A browser window opens.</li><li>Choose the <b>usual Google account</b> (the one the lives go to).</li><li>If Google says <b>&ldquo;Google hasn&rsquo;t verified this app&rdquo;</b>: tap <b>Advanced</b>, then <b>Go to Salsabeel live uploader</b>.</li><li>Tap <b>Allow</b>.</li></ol>'
+             buttons='<button class="tile" data-v="signin">Sign in</button><button class="tile later" data-v="later">Later</button>'
+             after='A browser window is opening. Choose the usual Google account, then Allow.' ;;
+        done) state="All set"; h1="All set, thank you!"; sub="The lives keep uploading. This won&rsquo;t ask again."; body=""
+              buttons='<button class="tile" data-v="ok">OK</button>'; after="Thank you!" ;;
+        blocked) state="Not yet"; h1="Google blocked the sign-in"; sub="Salsabeel&rsquo;s Google admin must trust the app first (Brandon has the steps)."
+                 body='<p class="msg gap">Nothing has changed: the lives keep uploading as before. It asks again in 2 hours.</p>'
+                 buttons='<button class="tile" data-v="ok">OK</button>'; after="OK." ;;
+        *) state="Not yet"; h1="The sign-in didn&rsquo;t finish"; sub="Nothing has changed: the lives keep uploading as before."
+           body='<p class="msg gap">It asks again in 2 hours.</p>'; buttons='<button class="tile" data-v="ok">OK</button>'; after="OK." ;;
+    esac
+    {
+        printf '<!DOCTYPE html>\n<html lang="en-GB">\n<head>\n<meta charset="utf-8">\n<title>Salsabeel: Google sign-in</title>\n'
+        sed -n '/<style>/,/<\/style>/p' "$TEMPLATE"
+        cat <<'CSS'
+<style>
+  body { padding: 20px; user-select: none; -webkit-user-select: none; cursor: default; }
+  .card { max-width: none; }
+  h1 { font-size: 36px; }
+  .sub { font-size: 19px; color: var(--muted); margin: -4px 0 0; }
+  .steps { font-size: 19px; line-height: 1.5; margin: 18px 0 0; padding-left: 26px; }
+  .row { display: flex; gap: 14px; margin-top: 24px; }
+  .tile { flex: 1; font: inherit; font-size: 28px; font-weight: 700; color: var(--text); background: #232327;
+    border: 2px solid var(--line); border-radius: 16px; padding: 20px 10px; cursor: pointer; }
+  .tile.later { flex: 0 0 30%; font-size: 20px; color: var(--muted); }
+  .tile:hover { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255,45,111,.25), 0 0 18px rgba(255,45,111,.35); }
+  #after { display: none; font-size: 20px; margin-top: 22px; }
+  .gap { margin-top: 20px; }
+  .picked .row { display: none; }
+  .picked #after { display: block; }
+</style>
+</head>
+<body>
+  <div class="card">
+CSS
+        grep 'class="brand"' "$TEMPLATE"
+        printf '    <div%s>\n    <div class="state"><span class="dot"></span>%s</div>\n    <h1>%s</h1>\n    <p class="sub">%s</p>\n    %s\n' "$( [ "$1" = done ] && echo ' class="done"')" "$state" "$h1" "$sub" "$body"
+        printf '    <div class="row">%s</div>\n    <p id="after" class="msg">%s</p>\n    </div>\n  </div>\n<script>\n' "$buttons" "$after"
+        printf '  var done = false;\n  function pick(v) { if (done) return; done = true; document.body.classList.add("picked"); document.title = "picked:" + v; }\n'
+        printf '  document.querySelectorAll(".tile").forEach(function (b) { b.addEventListener("click", function () { pick(b.getAttribute("data-v")); }); });\n'
+        if [ -n "${SALSABEEL_SIGNIN_TEST_PICK:-}" ]; then
+            printf '  var seen = 0; setInterval(function () { if (document.visibilityState !== "visible") return; if (!seen) seen = Date.now();\n'
+            printf '    if (Date.now() - seen > 2500) pick("%s"); }, 250);\n' "$SALSABEEL_SIGNIN_TEST_PICK"
+        fi
+        printf '</script>\n</body>\n</html>\n'
+    } > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+signin_window() {   # kind: shows it, prints what was tapped ("signin", "later", "ok"; nothing if closed or left)
+    local p t=0
+    if [ -n "${SALSABEEL_UPLOADER_SIGNIN_WINDOW:-}" ]; then "$SALSABEEL_UPLOADER_SIGNIN_WINDOW" "$1"; return; fi   # (the self-test)
+    signin_page "$1" || return 1
+    osascript -l JavaScript -e "$WHO_WINDOW" "$APP_DIR/signin.html" 760 "$( [ "$1" = ask ] && echo 600 || echo 440 )" > "$APP_DIR/signin.answer" 2>/dev/null &
+    p=$!
+    while kill -0 "$p" 2>/dev/null && [ "$t" -lt 900 ]; do sleep 1; t=$((t + 1)); done   # 15 minutes, then it closes
+    kill "$p" 2>/dev/null; wait "$p" 2>/dev/null
+    head -n 1 "$APP_DIR/signin.answer" 2>/dev/null | tr -d '\r'; rm -f "$APP_DIR/signin.answer"
+}
+google_signin() {   # (in the background) ask, sign in through our own app into a config file of its own, check it
+    local ans sc="$APP_DIR/signin.conf" out="$APP_DIR/signin.out" p t=0 why=""
+    ans=$(signin_window ask)
+    if [ "$ans" != signin ]; then
+        log "The Google sign-in was put off (\"${ans:-no answer}\"). It asks again in 2 hours."; return 0
+    fi
+    rm -f "$sc" "$out"
+    ( umask 077; RCLONE_CONFIG="$sc" exec "$RCLONE" config create "$SIGNIN_REMOTE" drive scope=drive \
+          client_id="$(app_key client_id)" client_secret="$(app_key client_secret)" ) > "$out" 2>&1 &
+    p=$!   # (Google's "blocked" page never comes back to rclone, so it would wait for ever: a time limit)
+    while kill -0 "$p" 2>/dev/null && [ "$t" -lt "$SIGNIN_WAIT" ]; do sleep 2; t=$((t + 2)); done
+    if kill -0 "$p" 2>/dev/null; then kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; why=timeout
+    elif ! wait "$p"; then why=failed; fi
+    if [ -z "$why" ] && ! RCLONE_CONFIG="$sc" "$RCLONE" lsf "$SIGNIN_REMOTE:${DEST#*:}/$CHECKS_FOLDER" --files-only \
+            --contimeout 15s --timeout 30s 2>/dev/null | grep -qxF "$STATUS_NAME"; then
+        why=folder   # signed in, but not to the Google account the lives go to
+    fi
+    if [ -z "$why" ]; then
+        touch "$APP_DIR/signin-ready"
+        log "Google sign-in done through Salsabeel's own Google app; it switches over before the next upload."
+        signin_window done >/dev/null; return 0
+    fi
+    if grep -qiE 'admin_policy_enforced|access_blocked|org_internal|disallowed_useragent|app is blocked' "$out" 2>/dev/null; then why=blocked; fi
+    rm -f "$sc"
+    case "$why" in
+        blocked) log "Google blocked the sign-in through our own app: salsabeel.com's Google admin must trust it first. The old sign-in still works; it asks again in 2 hours."
+                 signin_window blocked >/dev/null ;;
+        folder) log "The Google sign-in could not see the Salsabeel lives folder (a different Google account?). The old sign-in still works; it asks again in 2 hours."
+                signin_window failed >/dev/null ;;
+        *) log "The Google sign-in did not finish ($why). The old sign-in still works; it asks again in 2 hours."
+           signin_window failed >/dev/null ;;
+    esac
+}
+apply_signin() {   # between uploads: the new sign-in replaces the old one, checked, or the old one goes straight back
+    local conf sc="$APP_DIR/signin.conf"
+    [ -f "$APP_DIR/signin-ready" ] && [ -s "$sc" ] || return 0
+    conf=$(rclone_conf); [ -n "$conf" ] || return 0
+    cp -p "$conf" "$APP_DIR/rclone.conf.before-own-app" 2>/dev/null && chmod 600 "$APP_DIR/rclone.conf.before-own-app"
+    { awk -v r="[$REMOTE]" '$0 == r { s = 1; next } /^\[/ { s = 0 } !s' "$conf"
+      awk -v r="[$SIGNIN_REMOTE]" -v n="[$REMOTE]" '$0 == r { s = 1; print n; next } /^\[/ { s = 0 } s' "$sc"
+    } > "$conf.new" && chmod 600 "$conf.new" && mv -f "$conf.new" "$conf"
+    rm -f "$APP_DIR/signin-ready" "$sc"
+    if "$RCLONE" lsf "$DEST/$CHECKS_FOLDER" --files-only --contimeout 15s --timeout 30s 2>/dev/null | grep -qxF "$STATUS_NAME"; then
+        log "Switched to Salsabeel's own Google app (no more sharing rclone's). The old sign-in is kept as a spare on this Mac."
+    else
+        cp -p "$APP_DIR/rclone.conf.before-own-app" "$conf"
+        log "The new Google sign-in did not work for uploads, so the old one was put straight back. It asks again in 2 hours."
+    fi
+}
+maybe_ask_signin() {   # once the keys are here and it isn't switched yet: ask (not during a live; every 2 hours, or on wake)
+    local t
+    own_app_keys && is_remote || return 0
+    if on_own_app; then return 0; fi
+    [ ! -f "$APP_DIR/signin-ready" ] || return 0
+    if [ -s "$APP_DIR/signin.pid" ] && kill -0 "$(cat "$APP_DIR/signin.pid")" 2>/dev/null; then return 0; fi
+    if [ -f "$APP_DIR/live-on" ] || [ -n "$(live_studio_videos | head -n 1)" ]; then return 0; fi
+    t=$(date +%s)
+    if [ -f "$APP_DIR/signin-asked" ]; then
+        if [ $(( t - $(mtime "$APP_DIR/signin-asked") )) -lt "$SIGNIN_EVERY" ] &&
+           ! { [ -n "$PREV_RUN" ] && [ $(( t - PREV_RUN )) -ge "$SLEEP_GAP_SECONDS" ] && [ $(( t - $(mtime "$APP_DIR/signin-asked") )) -ge 600 ]; }; then
+            return 0   # asked less than 2 hours ago (and the Mac hasn't just woken)
+        fi
+    fi
+    touch "$APP_DIR/signin-asked"
+    log "Asked for the Google sign-in through Salsabeel's own Google app (a window on this Mac's screen)."
+    set -m   # its own process group: it outlives this run
+    google_signin </dev/null >/dev/null 2>&1 &
+    echo $! > "$APP_DIR/signin.pid"
+    set +m
+}
+if [ "${1:-}" = --signin-window ]; then signin_window "${2:-ask}"; exit 0; fi   # (a check: the window on its own)
 if [ "${1:-}" = --clock-in-helper ]; then clock_in_helper; exit 0; fi
 follow_live_studio
 while IFS= read -r f; do take_if_finished "$f" since; done < <(recordings)
@@ -1341,6 +1496,8 @@ empty_bin
 read_presenters
 start_live_watch
 ensure_helper
+apply_signin
+maybe_ask_signin
 rescue_moved
 
 pending() { find "$READY" -type f ! -name '.*' 2>/dev/null; }
@@ -1454,6 +1611,10 @@ start_upload() {   # the next rclone: the whole file, or the next part; sets rcl
     # DEBUG: rclone says why it starts a file again only at this level ("Received error: … - low level retry n/20")
     common=(--stats 2s --stats-one-line --stats-log-level NOTICE --log-level DEBUG --log-file "$PROGRESS"
             --rc --rc-addr "127.0.0.1:$port" --rc-user salsabeel --rc-pass "$RC_PASS")
+    if [ -f "$APP_DIR/ipv4-only" ]; then   # IPv6 to Google kept breaking: IPv4 only, for 7 days, then IPv6 is tried again
+        if [ $(( $(date +%s) - $(mtime "$APP_DIR/ipv4-only") )) -lt 604800 ]; then common+=(--bind 0.0.0.0)
+        else rm -f "$APP_DIR/ipv4-only"; log "Uploads may use IPv6 again (IPv4 only for 7 days is over)."; fi
+    fi
     USR2=""   # rclone toggles its --bwlimit on and off on SIGUSR2: a second way to slow it, if its remote control fails
     if [ "$mode" = live ]; then common+=(--bwlimit "$(rate_of "$cap")")
     elif [ -n "$BWLIMIT" ]; then common+=(--bwlimit "$BWLIMIT")
@@ -1630,6 +1791,10 @@ while kill -0 "$rclone_pid" 2>/dev/null; do
             elif [ "$tot_now" -gt $(( tot_first * 3 / 2 )) ]; then
                 resent=1
                 log "Google Drive keeps refusing the end of this upload and rclone keeps starting it again ($(human_size "${sizes#* / }") sent for a $(( total / 1048576 )) MB file), so it stops here."
+                if [ ! -f "$APP_DIR/ipv4-only" ] && grep -qE 'tcp \[[0-9a-fA-F:]+\]:[0-9]+ *-> *\[[0-9a-fA-F:]+\]:443.*(broken pipe|connection reset|reset by peer)' "$PROGRESS" 2>/dev/null; then
+                    touch "$APP_DIR/ipv4-only"   # (25 Nov: "write tcp [IPv6]->[Google IPv6]:443: broken pipe" behind a loop)
+                    log "The connection to Google over IPv6 kept breaking, so uploads use IPv4 only for the next 7 days."
+                fi
                 stop_upload
             fi
         fi

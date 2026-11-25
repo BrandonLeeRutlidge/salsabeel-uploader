@@ -889,10 +889,10 @@ check "Google app: the Mac makes an empty \"Mac Google app.txt\" in Drive for th
 printf '# Mac Google app\r\nclient_id=123-abc.apps.googleusercontent.com\r\n' > "$GA"; ago "$ROOT/app/presenters-checked" 20; bash "$ROOT/app/upload-lives.sh"
 check "Google app: half filled in (no secret yet): nothing is kept" '[ ! -e "$ROOT/app/google-app" ]'
 printf '# Mac Google app\r\nclient_id=123-abc.apps.googleusercontent.com\r\nclient_secret=GOCSPX-test\r\n' > "$GA"; ago "$ROOT/app/presenters-checked" 20; bash "$ROOT/app/upload-lives.sh"
-check "Google app: filled in: kept on the Mac (private to this user) and in the backup copy, and the log says to run the fixer" \
+check "Google app: filled in: kept on the Mac (private to this user) and in the backup copy, and the log says a window will ask for the sign-in" \
       '[ "$(cat "$ROOT/app/google-app")" = "$(printf "client_id=123-abc.apps.googleusercontent.com\nclient_secret=GOCSPX-test")" ] &&
        [ "$(stat -c %a "$ROOT/app/google-app" 2>/dev/null || stat -f %Lp "$ROOT/app/google-app")" = 600 ] &&
-       cmp -s "$ROOT/app/google-app" "$HOME/.salsabeel-uploader/google-app" && grep -q "Running \"Fix Salsabeel uploader\" once switches" "$ROOT/test.log"'
+       cmp -s "$ROOT/app/google-app" "$HOME/.salsabeel-uploader/google-app" && grep -q "A window on this Mac asks for the Google sign-in through it" "$ROOT/test.log"'
 rm -f "$GA" "$ROOT/app/google-app" "$HOME/.salsabeel-uploader/google-app"
 
 # "Fix Salsabeel uploader" switching the sign-in: no upload starts meanwhile (at most 30 minutes)
@@ -908,7 +908,9 @@ cat > "$ROOT/resend-rclone" <<EOF
 #!/bin/bash
 trap ':' USR2   # (real rclone takes this as "full speed")
 if [ "\$1" = move ]; then
+    echo "\$*" >> "$ROOT/resend-args"
     prev=""; for a in "\$@"; do if [ "\$prev" = --log-file ]; then lf=\$a; fi; prev=\$a; done
+    if [ -n "\${RESEND_V6:-}" ]; then echo "2026/11/25 03:56:02 DEBUG : pacer: low level retry 1/20 (error Post \\"https://www.googleapis.com/upload/drive/v3/files?alt=json\\": write tcp [2a00:23c6:1234::1]:65515->[2001:4860:4845:400::]:443: write: broken pipe)" >> "\$lf"; fi
     echo "2026/11/19 05:14:02 DEBUG : pacer: low level retry 1/20 (error Post \\"https://www.googleapis.com/upload/drive/v3/files?alt=json&fields=id%2Cname%2Csize%2Cmd5Checksum%2Ctrashed%2CexplicitlyTrashed%2CmodifiedTime%2CcreatedTime%2CmimeType%2Cparents%2CwebViewLink%2CshortcutDetails%2CexportLinks%2CresourceKey&supportsAllDrives=true&uploadType=resumable&upload_id=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\": googleapi: Error 500: Internal Error, backendError)" >> "\$lf"
     for i in 1 2 3 4 5 6 7 8 9 10; do
         echo "2026/11/19 05:14:0\$i NOTICE: Transferred:   	  \$(( i * 300 )) MiB / \$(( i * 300 + 100 )) MiB, 75%, 50 MiB/s, ETA 2s" >> "\$lf"; sleep 1
@@ -928,7 +930,16 @@ check "rclone's reason for starting again (its debug \"low level retry\" line) s
       'grep -q "rclone says (it keeps trying): .*files\": googleapi: Error 500" "$ROOT/test.log" && ! grep -q "upload_id" "$ROOT/test.log"'
 check "then it waits 5 minutes before trying again (not every minute)" \
       '[ "$(cut -d" " -f2 "$ROOT/app/rate-wait")" = 5 ] && grep -q "Google Drive kept refusing the upload, so it waits 5 minutes" "$ROOT/test.log"'
-rm -f "$ROOT/app/rate-wait" "$REC/Ready to upload/Salsabeel live 2026-11-15 19-09.mp4"; setup "$DRIVE"
+check "... a loop with no IPv6 break behind it does not switch to IPv4 only" '[ ! -f "$ROOT/app/ipv4-only" ] && ! grep -q -- "--bind" "$ROOT/resend-args"'
+# 25 Nov: the reason was "write tcp [IPv6]->[Google IPv6]:443: broken pipe": then uploads use IPv4 only for 7 days
+rm -f "$ROOT/app/rate-wait"; : > "$ROOT/test.log"; RESEND_V6=1 bash "$ROOT/app/upload-lives.sh"
+check "the IPv6 connection to Google broke behind the loop: IPv4 only from now on, and it says so" \
+      '[ -f "$ROOT/app/ipv4-only" ] && grep -q "over IPv6 kept breaking, so uploads use IPv4 only for the next 7 days" "$ROOT/test.log"'
+rm -f "$ROOT/app/rate-wait" "$ROOT/resend-args"; bash "$ROOT/app/upload-lives.sh"
+check "... the next upload goes over IPv4 only (rclone --bind 0.0.0.0)" 'grep -q -- "--bind 0.0.0.0" "$ROOT/resend-args"'
+ago "$ROOT/app/ipv4-only" $(( 8 * 24 * 60 )); rm -f "$ROOT/app/rate-wait" "$ROOT/resend-args"; : > "$ROOT/test.log"; bash "$ROOT/app/upload-lives.sh"
+check "... and after 7 days IPv6 is allowed again" '[ ! -f "$ROOT/app/ipv4-only" ] && ! grep -q -- "--bind" "$ROOT/resend-args" && grep -q "may use IPv6 again" "$ROOT/test.log"'
+rm -f "$ROOT/app/rate-wait" "$ROOT/app/ipv4-only" "$ROOT/resend-args" "$REC/Ready to upload/Salsabeel live 2026-11-15 19-09.mp4"; setup "$DRIVE"
 
 # Parts left from an unfinished upload (parts now off): deleted once that live went up whole, and nothing else
 PP="$DRIVE/Parts"; rm -rf "$PP"; mkdir -p "$PP/Salsabeel live 2026-11-13 16-24.mp4" "$PP/Salsabeel live 2026-11-16 10-00.mp4" "$PP/Salsabeel live 2026-11-16 11-00.mp4" "$PP/holiday"
@@ -1013,6 +1024,68 @@ sent=$(sed -n 's/.*Sent who was on "\(.*\)" to Drive (Alice)\./\1/p' "$ROOT/test
 check "restarted, then online again: who tapped in goes to Drive with that live ($sent)" \
       '[ -n "$sent" ] && ls "$DRIVE" | grep -q "presenters.txt" && [ -z "$(ls "$ROOT/app/presenters/" 2>/dev/null)" ]'
 rm -rf "$ROOT/app/presenters" "$ROOT/app/presenters.txt" "$DRIVE/Uploader checks/Presenters.txt"; setup "$DRIVE"
+
+# Our own Google app: the uploader itself asks for the Google sign-in, in a window (Brandon, 25 Nov)
+printf '[testdrive]\ntype = alias\nremote = %s\n' "$ROOT/Google Drive" > "$ROOT/rclone.conf"
+mkdir -p "$DRIVE/Uploader checks"; echo note > "$DRIVE/Uploader checks/Mac status.txt"; rm -f "$ROOT/app/google-app"
+cat > "$ROOT/signin-rclone" <<EOF
+#!/bin/bash
+# A pretend Google sign-in: "config create salsabeel-own-app" adds a remote (or is blocked); the rest is real rclone
+if [ "\$1 \$2 \$3" = "config create salsabeel-own-app" ]; then
+    echo "\$*" >> "$ROOT/signin-calls"
+    case "\$(cat "$ROOT/signin-mode" 2>/dev/null)" in
+        blocked) echo "Error 400: admin_policy_enforced"; exit 1 ;;
+        other) where="$ROOT/elsewhere" ;;
+        *) where="$ROOT/Google Drive" ;;
+    esac
+    printf '[salsabeel-own-app]\ntype = alias\nremote = %s\nclient_id = 123-abc.apps.googleusercontent.com\n' "\$where" >> "\$RCLONE_CONFIG"
+    exit 0
+fi
+exec "$RCLONE" "\$@"
+EOF
+cat > "$ROOT/signin-win" <<EOF
+#!/bin/bash
+echo "\$1" >> "$ROOT/signin-windows"
+if [ "\$1" = ask ]; then cat "$ROOT/signin-answer" 2>/dev/null || echo signin; else echo ok; fi
+EOF
+chmod +x "$ROOT/signin-rclone" "$ROOT/signin-win"; mkdir -p "$ROOT/elsewhere"
+printf 'WATCH_DIR=%q\nDEST=%q\nRCLONE=%q\nUPDATE_URL=""\n' "$REC" "testdrive:Salsabeel lives" "$ROOT/signin-rclone" > "$ROOT/app/config.sh"
+rm -f "$ROOT/signin-windows" "$ROOT/signin-calls" "$ROOT/app/signin-asked"
+sign_run() {   # a run, then wait for its sign-in (in the background) to finish
+    : > "$ROOT/test.log"
+    RCLONE_CONFIG="$ROOT/rclone.conf" SALSABEEL_UPLOADER_SIGNIN_WINDOW="$ROOT/signin-win" bash "$ROOT/app/upload-lives.sh"
+    for i in $(seq 1 40); do
+        if [ -s "$ROOT/app/signin.pid" ] && kill -0 "$(cat "$ROOT/app/signin.pid")" 2>/dev/null; then sleep 0.5; else break; fi
+    done
+}
+sign_run
+check "no keys for our own Google app yet: nothing is asked" '[ ! -f "$ROOT/app/signin-asked" ] && [ ! -f "$ROOT/signin-windows" ]'
+printf 'client_id=123-abc.apps.googleusercontent.com\nclient_secret=GOCSPX-test\n' > "$ROOT/app/google-app"
+echo later > "$ROOT/signin-answer"; sign_run
+check "keys here: a window asks for the Google sign-in; \"Later\" puts it off, and nothing changes" \
+      '[ "$(cat "$ROOT/signin-windows")" = ask ] && grep -q "The Google sign-in was put off" "$ROOT/test.log" && [ ! -f "$ROOT/signin-calls" ] && ! grep -q client_id "$ROOT/rclone.conf"'
+sign_run
+check "... and it doesn't ask again within 2 hours" '[ "$(grep -c . "$ROOT/signin-windows")" = 1 ]'
+rm -f "$ROOT/signin-answer"; echo blocked > "$ROOT/signin-mode"; ago "$ROOT/app/signin-asked" 121; sign_run
+check "2 hours later it asks again; Google blocks it (admin): the window says so, and the old sign-in is kept" \
+      'tail -n 1 "$ROOT/signin-windows" | grep -qx blocked && grep -q "Google blocked the sign-in through our own app" "$ROOT/test.log" &&
+       ! grep -q client_id "$ROOT/rclone.conf" && [ ! -f "$ROOT/app/signin.conf" ]'
+echo other > "$ROOT/signin-mode"; ago "$ROOT/app/signin-asked" 121; sign_run
+check "signed in to a Google account that can't see the lives folder: not used, the old sign-in is kept" \
+      'tail -n 1 "$ROOT/signin-windows" | grep -qx failed && grep -q "could not see the Salsabeel lives folder" "$ROOT/test.log" && ! grep -q client_id "$ROOT/rclone.conf"'
+rm -f "$ROOT/signin-mode"; ago "$ROOT/app/signin-asked" 121; start_live; n_before=$(grep -c . "$ROOT/signin-windows"); sign_run
+check "never during a live" '[ "$(grep -c . "$ROOT/signin-windows")" = "$n_before" ]'
+stop_live; rm -f "$REC/on_air.mp4"; touch "$ROOT/app/signin-asked"; sign_run   # (this run sees the live has stopped)
+ago "$ROOT/app/signin-asked" 121; sign_run
+check "signed in: \"All set, thank you\", and the old sign-in is still in use until the next run" \
+      'tail -n 1 "$ROOT/signin-windows" | grep -qx done && [ -f "$ROOT/app/signin-ready" ] && ! grep -q client_id "$ROOT/rclone.conf"'
+n_before=$(grep -c . "$ROOT/signin-windows"); sign_run
+check "the next run switches to our own app (checked), and the note says so" \
+      'grep -q "Switched to Salsabeel.s own Google app" "$ROOT/test.log" && grep -q "^client_id = 123-abc" "$ROOT/rclone.conf" &&
+       grep -c "^\[testdrive\]" "$ROOT/rclone.conf" | grep -qx 1 && ! grep -q "salsabeel-own-app" "$ROOT/rclone.conf" && [ -s "$ROOT/app/rclone.conf.before-own-app" ]'
+ago "$ROOT/app/signin-asked" 300; rm -f "$ROOT/app/status-sent"; sign_run
+check "... then it never asks again" '[ "$(grep -c . "$ROOT/signin-windows")" = "$n_before" ] && grep -q "^Google app: *Salsabeel.s own" "$DRIVE/Uploader checks/Mac status.txt"'
+rm -f "$ROOT/app/google-app" "$ROOT/app/signin-"* "$ROOT/app/rclone.conf.before-own-app"; setup "$DRIVE"
 
 # The note says what LIVE Studio's own files say about sound (does the chime go out on the live?)
 mkdir -p "$HOME/Library/Application Support/TikTok LIVE Studio"
