@@ -968,6 +968,8 @@ start_live; t0=$(date +%s)
 for i in $(seq 1 15); do grep -q "Asked \"Clock in\"" "$ROOT/test.log" && break; sleep 1; done; seen=$(( $(date +%s) - t0 ))
 check "a live starts between runs: \"Clock in\" shows within seconds ($seen s), without waiting for the next minute" \
       'grep -q "Live started" "$ROOT/test.log" && grep -q "Asked \"Clock in\"" "$ROOT/test.log" && [ "$seen" -le 5 ]'
+check "... and the log says why it had to open fresh (no helper running here)" \
+      'grep -q "Asked \"Clock in\" (opened fresh, because the \"Clock in\" helper is not running)" "$ROOT/test.log"'
 for i in $(seq 1 15); do grep -q "(clicked)" "$ROOT/test.log" && break; sleep 1; done
 n_at_tap=$(grep -c . "$ROOT/chimes" 2>/dev/null || echo 0); sleep 5; n_after=$(grep -c . "$ROOT/chimes" 2>/dev/null || echo 0)
 check "a chime as it shows and again until a name is tapped ($n_at_tap), then no more ($n_after)" \
@@ -1003,6 +1005,9 @@ SALSABEEL_UPLOADER_STANDBY_CMD="$ROOT/fake-standby" SALSABEEL_UPLOADER_HELPER_SE
 for i in $(seq 1 40); do [ -f "$ROOT/app/standby/trigger.ready" ] && break; sleep 0.25; done
 check "the helper keeps the window loaded and hidden, and never takes the uploader's turn" \
       '[ -f "$ROOT/app/standby/trigger.ready" ] && [ ! -e "$ROOT/app/standby/trigger" ] && [ ! -f "$ROOT/app/running.pid" ]'
+bash "$ROOT/app/upload-lives.sh" --status-now >/dev/null 2>&1; rm -f "$ROOT/offline-calls"   # (the note tries Drive; the helper must not)
+check "... and the Mac's note says so (Clock in: helper running, window loaded and ready)" \
+      'grep -q "^Clock in: *helper running, window loaded and ready; window loaded 1 time in the last 24 hours" "$ROOT/app/Mac status.txt"'
 made=$(python3 -c 'import time; print(int(time.time()*1000))'); head -c 4096 /dev/zero > "$REC/fresh live.mp4"
 for i in $(seq 1 40); do [ -f "$ROOT/shown-at" ] && break; sleep 0.1; done
 shown_ms=$(( $(cat "$ROOT/shown-at" 2>/dev/null || echo 99999999999999) - made ))
@@ -1010,7 +1015,7 @@ check "offline, uploader not running: a recording appears and \"Clock in\" shows
       '[ "$shown_ms" -ge 0 ] && [ "$shown_ms" -lt 1000 ] && [ "$(cat "$ROOT/standby-names")" = "Alice Bea Cara" ] && grep -q "Live started (file \"$REC/fresh live.mp4\")" "$ROOT/test.log"'
 for i in $(seq 1 20); do grep -q "(clicked)" "$ROOT/test.log" && break; sleep 0.5; done
 check "... the log says whether it really showed (here: covered on both screens, LIVE Studio in front)" \
-      'grep -q "\"Clock in\" is NOT visible: macOS says it is covered on all 2 screens (in front: TikTok LIVE Studio)" "$ROOT/test.log"'
+      'grep -q "\"Clock in\" is NOT visible: macOS says it is covered on all 2 screens (in front: TikTok LIVE Studio)" "$ROOT/test.log" && grep -q "Asked \"Clock in\" (shown at once: it was ready)" "$ROOT/test.log"'
 check "... the name tapped on it is saved on this Mac with the time, the chime played, and nothing went online" \
       'grep -q "Alice.*(clicked)" "$ROOT/test.log" && grep -qx Alice "$ROOT/app/presenters/"*.names && [ -s "$ROOT/app/presenters/"*.at ] && [ -s "$ROOT/chimes" ] && [ ! -e "$ROOT/offline-calls" ]'
 ago "$REC/fresh live.mp4" 10; rm -f "$ROOT/app/live-on" "$ROOT/shown-at"
